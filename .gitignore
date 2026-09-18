@@ -1,0 +1,21 @@
+# Python
+*.pyc
+__pycache__/
+
+# 浏览器用户目录：655MB，而且**含登录态凭据**（Cookies / Login Data），
+# 绝对不能提交。目录名见 run.py 里的 PROFILE。
+edge/
+.profile/
+
+# 模型配置：里面有 api_key
+brain.config.json
+
+# 运行产物：日志、调试截图
+runs/
+
+# 旧实现的存档（保留在本地，不上传）
+archive/
+
+# 编辑器 / 本地会话配置
+.vscode/
+.zcode/

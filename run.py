@@ -30,6 +30,8 @@ PROFILE = ROOT / "edge"          # 专用用户目录（登录态存在这里，
 ENTRY = "https://v8.chaoxing.com/"
 REFRESH_MS = 150         # 界面贴图间隔（毫秒）
 MAX_STEPS = 50         # 一个回合最多跑多少步，防止模型停不下来
+MAX_WAIT = 600.0        # 单次 wait 的上限（秒）。看视频要等很久，这个得放得够大；
+                        # 提示词里告诉模型的数字要和这里一致，否则它按 600 规划、程序只等 30
 WAIT_SLICE = 0.2         # wait 分片检查停止信号的间隔
 
 # 浏览器窗口的页面区域尺寸。网站会按这个尺寸自动排版，
@@ -552,13 +554,19 @@ class Viewer(ctk.CTk):
         return "（数据参考：" + "；".join(out) + "——**以你看到的两张图为准**）"
 
     def _wait(self, seconds: float) -> str:
-        """等待，但分成小片，这样停止按钮能立刻响应。"""
-        seconds = max(0.0, min(30.0, seconds))
+        """等待，但分成小片，这样停止按钮能立刻响应。
+
+        上限见 MAX_WAIT。分片睡是为了让"停止"能秒响应——
+        哪怕模型让等 600 秒，你点停止也就 0.2 秒内结束，不会卡住整个界面。
+        """
+        seconds = max(0.0, min(MAX_WAIT, seconds))
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             if self._stop_evt.is_set():
                 return f"等待中断（{seconds:.0f}s 未走完）"
             time.sleep(WAIT_SLICE)
+        if seconds >= 60:
+            return f"已等待 {seconds:.0f}s（约 {seconds / 60:.0f} 分钟）"
         return f"已等待 {seconds:.0f}s"
 
     def refresh(self) -> None:

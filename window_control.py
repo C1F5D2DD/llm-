@@ -27,7 +27,7 @@ from ctypes import wintypes
 from typing import Optional
 
 __all__ = ["init", "find_hwnd", "click", "drag", "scroll",
-           "type_text", "press_key", "page_state", "page_info",
+           "type_text", "press_key", "page_state", "page_info", "video_info",
            "move_out", "move_in", "resize", "WindowError"]
 
 DEFAULT_PORT = 9222     # Edge 的调试端口，和 run.py 里启动时用的一致
@@ -67,6 +67,41 @@ _SCROLL_STEP = 100      # 一"格"滚多少像素
 # （实测死循环到步数上限）。
 _PAGE_STATE_JS = ("JSON.stringify({u: location.href, t: document.title, "
                   "y: Math.round(window.scrollY)})")
+
+# 视频的真实播放状态，**递归钻同源 iframe**。
+# 为什么必须由程序来读、不能靠模型看图：播放器正中那个圆钮，播放时是"暂停"图标、
+# 暂停时是"播放"图标，两者在截图里几乎一样。模型分不清，就会对正在播的视频再点一下，
+# 反而把它暂停了（实测踩过：模型报告"视频已开始播放"、实际刚被自己点停），
+# 然后心安理得地等 600 秒——整段等待全白费。
+# 学习通的播放器嵌在 mooc1.chaoxing.com 的 iframe 里，与主文档同源，contentDocument 读得到。
+_VIDEO_JS = """(() => {
+  const out = [], seen = new Set();
+  function walk(doc, depth) {
+    if (!doc || depth > 6) return;
+    try {
+      for (const v of doc.querySelectorAll('video')) {
+        if (seen.has(v)) continue;
+        seen.add(v);
+        out.push({
+          paused: v.paused,
+          t: Math.round(v.currentTime || 0),
+          dur: Math.round(v.duration || 0),
+          rate: v.playbackRate,
+          ended: v.ended,
+        });
+      }
+    } catch (e) {}
+    try {
+      for (const f of doc.querySelectorAll('iframe')) {
+        let inner = null;
+        try { inner = f.contentDocument; } catch (e) { inner = null; }   // 跨域 = null
+        if (inner) walk(inner, depth + 1);
+      }
+    } catch (e) {}
+  }
+  walk(document, 0);
+  return JSON.stringify(out);
+})()"""
 
 # 页面有多大、滚到哪了、有没有自己的滚动区。
 # 模型只看得到视口这一屏，不知道下面还有东西，就会对着"屏幕上看得见但不是目标"的元素反复点。
@@ -519,6 +554,50 @@ def _tab_count() -> int:
                     and (t.get("url") or "").startswith(("http://", "https://"))])
     except Exception:
         return -1
+
+
+def video_info() -> str:
+    """页面上视频的真实播放状态，拼成一句话给模型。没有视频就返回空串。
+
+    **这是程序唯一能替模型"看准"的东西**：播放器正中的圆钮在截图里看着都一样，
+    模型分不清"正在播"和"已暂停"，经常对着正在播的视频再点一下把它点停，
+    还以为自己"开始播放"了，然后白等 10 分钟（实测踩过）。
+
+    返回值形如「视频正在播放，进度 7:22 / 33:00；距播完还需约 25 分 38 秒」。
+    """
+    try:
+        raw = _require().eval(_VIDEO_JS)
+        vids = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return ""
+    if not isinstance(vids, list) or not vids:
+        return ""
+
+    v = vids[0]        # 一屏基本只有一个播放器；有多个就看第一个
+    try:
+        t = int(v.get("t") or 0)
+        dur = int(v.get("dur") or 0)
+        rate = float(v.get("rate") or 1)
+
+        def mmss(x: int) -> str:
+            return f"{x // 60}:{x % 60:02d}"
+
+        if v.get("ended"):
+            state = "已播放完毕"
+        elif v.get("paused"):
+            state = "**已暂停，没有在播**（要播放必须点播放键，别再点视频中央）"
+        else:
+            state = "正在播放"
+
+        parts = [f"视频{state}，进度 {mmss(t)} / {mmss(dur)}"]
+        if rate != 1:
+            parts.append(f"倍速 {rate:g}x")
+        if not v.get("paused") and not v.get("ended") and dur > t:
+            remain = (dur - t) / max(0.1, rate)
+            parts.append(f"距播完还需约 {int(remain // 60)} 分 {int(remain % 60)} 秒")
+        return "；".join(parts)
+    except Exception:
+        return ""
 
 
 def page_info() -> str:

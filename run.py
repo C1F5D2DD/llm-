@@ -459,6 +459,11 @@ class Viewer(ctk.CTk):
                 img = capture.get_frame()
                 extra = self._drain_inbox()
                 page = wc.page_info()
+                # 视频的真实状态（有没有在播、进度多少）——模型光看截图分不清
+                # "正在播"和"已暂停"，会对着正在播的视频再点一下把它点停（踩过）
+                video = wc.video_info()
+                if video:
+                    page = f"{page}；{video}" if page else video
 
                 d = brain.decide(img, goal, extra=extra, page=page)
                 self._ui("ai", d.thought)

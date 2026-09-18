@@ -186,6 +186,14 @@ class Viewer(ctk.CTk):
         self.cfg_hint.pack(side="left", padx=(8, 0))
         self._load_config()     # 有存过的就填进输入框
 
+        # 最大轮数：一个回合里模型最多能做多少次决策，防止它停不下来。
+        # 放在这一行右侧，不新增行（新增行要改后面所有行号，容易撞车）。
+        self.max_steps = ctk.StringVar(value=str(MAX_STEPS))
+        ctk.CTkEntry(cfg_row, textvariable=self.max_steps, width=52, height=26,
+                     font=("Microsoft YaHei", 12)).pack(side="right")
+        ctk.CTkLabel(cfg_row, text="最大轮数", anchor="e",
+                     font=("Microsoft YaHei", 12)).pack(side="right", padx=(0, 6))
+
         ctk.CTkLabel(self.panel, text="点击 / 滚动测试", anchor="w",
                      font=("Microsoft YaHei", 13, "bold")).grid(
             row=5, column=0, columnspan=2, sticky="w", padx=(14, 8), pady=(16, 2))
@@ -302,19 +310,26 @@ class Viewer(ctk.CTk):
             row=row, column=1, sticky="ew", padx=(0, 14), pady=4)
 
     def on_toggle(self):
-        """显示/隐藏 Edge 窗口。挪窗口有 sleep，放子线程免得卡界面。"""
+        """显示/隐藏 Edge 窗口。挪窗口有 sleep，放子线程免得卡界面。
+
+        注意这里先把要显示的文字算好、再交给 after——**不能把 except 里的 exc
+        直接写进 lambda**。Python 3 在 except 块结束时会删掉 exc 这个名字，
+        而 after 的回调是稍后才跑的，那时 exc 已经没了，回调会抛 NameError，
+        把真正的失败原因整个吞掉（实测踩过：界面上啥也看不到，
+        控制台刷一屏 "cannot access free variable 'exc'"）。
+        """
+        show = bool(self.edge_on.get())
+
         def work():
             try:
-                if self.edge_on.get():
+                if show:
                     wc.move_in()
                 else:
                     wc.move_out()
-                self.after(0, lambda: self.status.configure(
-                    text="已显示浏览器窗口" if self.edge_on.get() else "已隐藏浏览器窗口",
-                    text_color="#e8f4e8"))
+                msg, color = ("已显示浏览器窗口" if show else "已隐藏浏览器窗口"), "#e8f4e8"
             except Exception as exc:
-                self.after(0, lambda: self.status.configure(
-                    text=f"失败：{exc}", text_color="#ffd0d0"))
+                msg, color = f"失败：{exc}", "#ffd0d0"
+            self.after(0, lambda: self.status.configure(text=msg, text_color=color))
         threading.Thread(target=work, daemon=True).start()
 
     def _coords(self):
@@ -403,6 +418,16 @@ class Viewer(ctk.CTk):
             return False
         return True
 
+    def _turn_limit(self) -> int:
+        """读界面上设的「最大轮数」。填得不对就用默认值，不让它把回合搞崩。
+
+        每轮都重新读，所以运行中把它调小能立刻让回合停下来。
+        """
+        try:
+            return max(1, int(float(self.max_steps.get())))
+        except (ValueError, AttributeError):
+            return MAX_STEPS
+
     def _agent(self, goal: str) -> None:
         """模型回合（子线程）：循环 截图→决策→执行，直到模型说停、到上限、或被停止。
 
@@ -410,8 +435,10 @@ class Viewer(ctk.CTk):
         """
         try:
             while not self._stop_evt.is_set():
-                if self._step >= MAX_STEPS:
-                    self._ui("done", f"到 {MAX_STEPS} 步上限，先停下")
+                limit = self._turn_limit()
+                if self._step >= limit:
+                    self._ui("done", f"到 {limit} 轮上限，先停下"
+                                     f"（可以在左边改「最大轮数」再继续）")
                     break
 
                 img = capture.get_frame()

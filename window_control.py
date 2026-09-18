@@ -46,6 +46,12 @@ user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.c_void_p]
 user32.GetDpiForWindow.argtypes = [wintypes.HWND]
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetSystemMetrics.restype = ctypes.c_int
+# SetWindowPos 原来漏了 argtypes。参数里有 HWND（64 位指针），不声明就按 C int 传，
+# 在 64 位系统上属于把指针当整数塞，靠 hwnd 数值恰好不大才没出事。
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_uint]
+user32.SetWindowPos.restype = wintypes.BOOL
 
 SW_RESTORE = 9
 SWP_NOACTIVATE = 0x0010
@@ -231,6 +237,7 @@ class _CDP:
 
 _cdp: Optional[_CDP] = None
 _hwnd: Optional[int] = None
+_pid: Optional[int] = None       # 记着 pid，句柄失效时好按它重新找窗口
 
 
 def init(pid: int) -> int:
@@ -240,8 +247,9 @@ def init(pid: int) -> int:
     Edge 必须带 --remote-debugging-port=9222 启动，否则连不上——
     Chromium 忽略程序伪造的鼠标消息，只能走调试协议才能后台点击。
     """
-    global _cdp, _hwnd
+    global _cdp, _hwnd, _pid
 
+    _pid = pid
     _hwnd = _find_window(pid)
     if _hwnd is None:
         raise WindowError(f"进程 {pid} 没找到浏览器窗口，确认它开着且没最小化")
@@ -260,6 +268,40 @@ def init(pid: int) -> int:
 
     _cdp = cdp
     return _hwnd
+
+
+def _live_hwnd() -> int:
+    """取一个**当前有效**的窗口句柄，失效就按 pid 重新找。
+
+    窗口句柄不是永久的：Edge 重启、Chromium 重建窗口之后，原来存下的 hwnd
+    就成了死句柄。拿死句柄调 GetWindowRect 会失败 → `_rect()` 返回 None →
+    再往下 `r[2]` 抛 "NoneType is not subscriptable"，
+    报错信息里完全看不出是句柄过期了（实测踩过，表现为"窗口挪不动"）。
+    """
+    global _hwnd
+
+    if _hwnd and user32.IsWindow(_hwnd):
+        return _hwnd
+    if _pid:
+        found = _find_window(_pid)
+        if found:
+            _hwnd = found
+            return found
+    raise WindowError("浏览器窗口不见了（可能 Edge 被关掉或重启过），"
+                      "重新启动本程序再接管一次")
+
+
+def _place(hwnd: int, x: int, y: int, w: int, h: int) -> None:
+    """挪/改窗口，失败就明确报错。
+
+    原来不看 SetWindowPos 的返回值——它失败时只返回 0，一路静默，
+    表现就是"点了没反应"，完全无从排查。
+    """
+    ok = user32.SetWindowPos(hwnd, 0, int(x), int(y), int(w), int(h),
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+    if not ok:
+        raise WindowError(f"移动窗口失败（SetWindowPos 返回 0，错误码 "
+                          f"{ctypes.get_last_error()}）")
 
 
 def _require() -> _CDP:
@@ -535,39 +577,41 @@ def move_out() -> None:
     （早先以为挪到屏幕外能保持渲染，那是误判——当时页面本身在播动画）。
     所以只在"暂时不需要画面"时用，别拿它当后台运行的方案。
     """
-    if not _hwnd:
-        raise WindowError("还没接管窗口，先调用 init(pid)")
+    hwnd = _live_hwnd()
     _restore()
-    r = _rect(_hwnd)
-    user32.SetWindowPos(_hwnd, 0, OFFSCREEN_X, OFFSCREEN_Y, r[2] - r[0], r[3] - r[1],
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+    r = _rect(hwnd)
+    if r is None:
+        raise WindowError("读不到窗口位置（窗口可能刚被关掉），挪动失败")
+    _place(hwnd, OFFSCREEN_X, OFFSCREEN_Y, r[2] - r[0], r[3] - r[1])
 
 
 def move_in() -> None:
     """把窗口挪回屏幕（居中偏上）。"""
-    if not _hwnd:
-        raise WindowError("还没接管窗口，先调用 init(pid)")
+    hwnd = _live_hwnd()
     _restore()
-    r = _rect(_hwnd)
+    r = _rect(hwnd)
+    if r is None:
+        raise WindowError("读不到窗口位置（窗口可能刚被关掉），挪动失败")
     w = r[2] - r[0]
-    user32.SetWindowPos(_hwnd, 0, max(0, (user32.GetSystemMetrics(0) - w) // 2), 60,
-                        w, r[3] - r[1], SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+    _place(hwnd, max(0, (user32.GetSystemMetrics(0) - w) // 2), 60,
+           w, r[3] - r[1])
 
 
 def resize(width: int, height: int) -> None:
     """改窗口大小（物理像素），位置不变。"""
-    if not _hwnd:
-        raise WindowError("还没接管窗口，先调用 init(pid)")
+    hwnd = _live_hwnd()
     _restore()
-    r = _rect(_hwnd)
-    user32.SetWindowPos(_hwnd, 0, r[0], r[1], int(width), int(height),
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+    r = _rect(hwnd)
+    if r is None:
+        raise WindowError("读不到窗口位置（窗口可能刚被关掉），改大小失败")
+    _place(hwnd, r[0], r[1], width, height)
 
 
 def _restore() -> None:
-    if _hwnd and user32.IsIconic(_hwnd):
-        user32.ShowWindow(_hwnd, SW_RESTORE)
+    hwnd = _live_hwnd()
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
         for _ in range(15):
             time.sleep(0.2)
-            if not user32.IsIconic(_hwnd):
+            if not user32.IsIconic(hwnd):
                 break

@@ -40,6 +40,13 @@ VIEW_W = 1080
 VIEW_H = 720
 RIGHT_MIN_W = 420        # 右栏（对话区）的最小宽度，免得被左侧画面挤没
 
+# 对话区最多占多少像素高，超过就把最早的丢掉。
+# **必须限高**：tkinter 的绘制坐标上限约 32767px，超了之后靠后的消息画不出来，
+# 整个对话区看起来是空的（实测踩过）。按像素而不是条数来限，是因为
+# 一条消息可能折好几行，只数条数兜不住。
+# 另外控件越多每次追加越慢，所以这个值也不能给太大。
+CHAT_MAX_PX = 20000
+
 # 对话区不同来源的样式（前缀、文字色、是否加粗）
 _STYLE = {
     "you": ("你", "#1f2937", True),
@@ -163,6 +170,8 @@ class Viewer(ctk.CTk):
         # 和 _stop_evt（结束整个回合）分开——插话只是想跳过剩余等待，不是要停。
         self._interrupt = threading.Event()
         self._waiting = False       # 是否正卡在 wait 里（决定插话时提示哪句话）
+        self._scroll_pending = False  # 已排了一个滚动回调，别重复排
+        self._chat_h = 0            # 对话区已占高度（px），超 CHAT_MAX_PX 就丢老的
 
         # ---- 左栏下方：控制面板 ----
         self.panel = ctk.CTkFrame(self.left, corner_radius=16, fg_color="#83a2eb",
@@ -276,23 +285,49 @@ class Viewer(ctk.CTk):
 
     # ---------- 对话区 ----------
     def _say(self, kind: str, text: str) -> None:
-        """往对话区追加一条。必须在主线程调用。"""
+        """往对话区追加一条。必须在主线程调用。
+
+        两个坑都踩过，这里一起说明：
+        1. **必须限高**：控件堆到 tkinter 的坐标上限（约 32767px）之后，
+           新消息画不出来，整个对话区看着是空的。
+        2. **不能用 grid 行号**：grid 的 row 必须唯一且连续，丢掉最早那条之后
+           就得把剩下的全部重排一遍——那是 O(n) 每条消息，几百条就卡死了
+           （实测）。pack 按加入顺序排，丢最早的不影响其它，天然 O(1)。
+        """
         prefix, color, bold = _STYLE.get(kind, _STYLE["note"])
         font = ("Microsoft YaHei", 12, "bold") if bold else ("Microsoft YaHei", 12)
         wrap = max(200, self.chat.winfo_width() - 24)
         lbl = ctk.CTkLabel(self.chat, text=f"{prefix}  {text}", anchor="w", justify="left",
                            wraplength=wrap, font=font, text_color=color)
-        # 行号用当前子控件数（不能用 len-1：清空后是 -1，grid 行为会很怪）
-        lbl.grid(row=len(self.chat.winfo_children()), column=0, sticky="w", padx=6, pady=2)
-        self.after(50, self._scroll_bottom)
+        lbl.pack(fill="x", padx=6, pady=2, anchor="w")
+
+        # 按累计高度丢老消息。用控件自己报的请求高度累加，
+        # 不去问布局（winfo_reqheight 要等重排，取到的是旧值）。
+        self._chat_h += max(0, lbl.winfo_reqheight())
+        kids = self.chat.winfo_children()
+        while len(kids) > 1 and self._chat_h > CHAT_MAX_PX:
+            oldest = kids[0]
+            self._chat_h -= max(0, oldest.winfo_reqheight())
+            oldest.destroy()
+            kids = self.chat.winfo_children()
+
+        self._scroll_bottom()
 
     def _scroll_bottom(self) -> None:
-        if self._closing:
+        """滚到底。多条消息连续来时只排一次滚动，别每次追加都排一个 after。"""
+        if self._closing or self._scroll_pending:
             return
-        try:
-            self.chat._parent_canvas.yview_moveto(1.0)
-        except Exception:
-            pass
+        self._scroll_pending = True
+
+        def do():
+            self._scroll_pending = False
+            if self._closing:
+                return
+            try:
+                self.chat._parent_canvas.yview_moveto(1.0)
+            except Exception:
+                pass
+        self.after(50, do)
 
     def _ui(self, kind: str, text: str) -> None:
         """子线程安全地追加一条对话。"""
@@ -416,6 +451,7 @@ class Viewer(ctk.CTk):
         brain.reset()
         for w in list(self.chat.winfo_children()):
             w.destroy()
+        self._chat_h = 0
         self._say("note", "已清空")
 
     def _ensure_brain(self) -> bool:

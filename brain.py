@@ -217,6 +217,7 @@ def init(base_url: str, api_key: str, model: str,
     from openai import OpenAI      # 延迟导入：没配模型时也能用别的模块
 
     _ensure_log()
+    base_url = _clean_base_url(base_url)
     _client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
     _model = model
     _options = {
@@ -227,6 +228,25 @@ def init(base_url: str, api_key: str, model: str,
     reset()
     _log.info("配置模型：%s @ %s   json_mode=%s   日志→%s",
               model, base_url, json_mode, LOG_PATH)
+
+
+def _clean_base_url(url: str) -> str:
+    """把 base_url 收拾成 OpenAI 库要的样子。
+
+    **最容易踩的坑是末尾多带 `/chat/completions`**：各家文档到处都在给完整接口
+    地址，复制粘贴就中招。而 OpenAI 库会自己再拼一次，于是请求打到
+    `/v4/chat/completions/chat/completions` 上——服务端 404，报错信息里
+    只写 "Not Found"，完全看不出是自己多填了一段（踩过）。
+    """
+    url = url.strip().rstrip("/")
+    for suffix in ("/chat/completions", "/completions", "/v1/chat"):
+        if url.endswith(suffix):
+            fixed = url[: -len(suffix)].rstrip("/")
+            _log.warning("base_url 末尾多了 %r，已自动去掉：%s -> %s",
+                         suffix, url, fixed)
+            url = fixed
+            break
+    return url
 
 
 def reset() -> None:
@@ -355,11 +375,13 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
             try:
                 resp = _client.chat.completions.create(**kwargs)
             except Exception as exc2:
+                msg = _explain(exc2)
                 _log.error("调用模型失败：%s", exc2)
-                raise BrainError(f"调用模型失败：{exc2}") from exc2
+                raise BrainError(msg) from exc2
         else:
+            msg = _explain(exc)
             _log.error("调用模型失败：%s", exc)
-            raise BrainError(f"调用模型失败：{exc}") from exc
+            raise BrainError(msg) from exc
 
     _log_raw(resp)
     return resp
@@ -379,6 +401,31 @@ def _is_param_error(exc: Exception) -> bool:
         return True
     text = str(exc).lower()
     return "response_format" in text or "json_object" in text
+
+
+def _explain(exc: Exception) -> str:
+    """把调用失败翻译成人能看懂的一句话。
+
+    网关报的错经常只有一个 "Not Found"，看不出是自己配置填错了（踩过：
+    base_url 末尾多带了 /chat/completions，请求打到 …/chat/completions/chat/completions
+    上，服务端 404，报错里完全不提这件事）。
+    """
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+
+    if code == 404:
+        return (f"接口地址不对（404）：{exc}\n"
+                f"    当前 base_url = {_client.base_url if _client else '(未配置)'}\n"
+                f"    注意 base_url 只填到版本号那一层，别带 /chat/completions——"
+                f"库会自己接上，多填就会拼成两遍导致 404")
+    if code in (401, 403):
+        return f"密钥无效或没权限（{code}）：{exc}"
+    if code == 429:
+        return f"请求太频繁或额度用完了（429）：{exc}"
+    if code and 500 <= code < 600:
+        return f"服务端出错（{code}），过会儿再试：{exc}"
+    return f"调用模型失败：{exc}"
 
 
 def _log_raw(resp) -> None:

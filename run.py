@@ -146,14 +146,6 @@ class Viewer(ctk.CTk):
                                    font=("Microsoft YaHei", 13))
         self.screen.grid(row=1, column=0, sticky="nw", padx=4)
 
-        # 开关：显示/隐藏浏览器窗口。
-        # 默认开——窗口本来就在屏幕上；关掉会挪到屏幕外，但那样浏览器会停止渲染，
-        # 画面就冻在最后一帧了，所以只在不需要画面时才关。
-        self.edge_on = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(self.left, text="显示浏览器窗口", variable=self.edge_on,
-                      command=self.on_toggle).grid(
-            row=2, column=0, sticky="w", padx=4, pady=(10, 4))
-
         self._size = None       # 画面显示尺寸（逻辑像素），每帧按左栏宽度算
         self._img = None        # 当前的 CTkImage
         self._winsize = None    # 首帧定过窗口尺寸后就置真，不再重复设
@@ -169,7 +161,7 @@ class Viewer(ctk.CTk):
         # ---- 左栏下方：控制面板 ----
         self.panel = ctk.CTkFrame(self.left, corner_radius=16, fg_color="#83a2eb",
                                   border_width=1, border_color="#00040d")
-        self.panel.grid(row=3, column=0, sticky="ew", padx=4, pady=(4, 2))
+        self.panel.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
         self.panel.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(self.panel, text="模型配置", anchor="w",
@@ -219,7 +211,15 @@ class Viewer(ctk.CTk):
 
         self.status = ctk.CTkLabel(self.panel, text="", anchor="w",
                                    font=("Microsoft YaHei", 11))
-        self.status.grid(row=8, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 12))
+        self.status.grid(row=8, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 4))
+
+        # 开关：显示/隐藏浏览器窗口。
+        # 默认开——窗口本来就在屏幕上；关掉会挪到屏幕外，但那样浏览器会停止渲染，
+        # 画面就冻在最后一帧了，所以只在不需要画面时才关。
+        self.edge_on = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(self.panel, text="显示浏览器窗口", variable=self.edge_on,
+                      command=self.on_toggle).grid(
+            row=9, column=0, columnspan=2, sticky="w", padx=14, pady=(4, 12))
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 

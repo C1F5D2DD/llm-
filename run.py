@@ -159,6 +159,10 @@ class Viewer(ctk.CTk):
         self._stop_evt = threading.Event()
         self._inbox: "queue.Queue[str]" = queue.Queue()
         self._step = 0
+        # 「插话打断等待」用：发消息时置上，让 _wait 立刻收工去处理你说的话。
+        # 和 _stop_evt（结束整个回合）分开——插话只是想跳过剩余等待，不是要停。
+        self._interrupt = threading.Event()
+        self._waiting = False       # 是否正卡在 wait 里（决定插话时提示哪句话）
 
         # ---- 左栏下方：控制面板 ----
         self.panel = ctk.CTkFrame(self.left, corner_radius=16, fg_color="#83a2eb",
@@ -366,7 +370,12 @@ class Viewer(ctk.CTk):
 
     # ================= 模型回合 =================
     def on_send(self) -> None:
-        """发一句话。运行中就排队带到下一步，不然开一个新回合。"""
+        """发一句话。运行中就排队带到下一步，不然开一个新回合。
+
+        **正在等待时发消息会立刻打断那次等待**——不然模型让等 10 分钟，
+        你这句"任务点已经完成了"要干等完才轮到，白耗那么久。
+        打断只是跳过剩余等待，回合继续跑（想彻底停请点停止）。
+        """
         text = self.msg.get().strip()
         if not text:
             return
@@ -375,7 +384,10 @@ class Viewer(ctk.CTk):
 
         if self._running:
             self._inbox.put(text)
-            self._say("note", "已记下，下一步带上")
+            waiting = self._waiting
+            self._interrupt.set()        # 让 _wait 马上收工（没在等就无副作用）
+            self._say("note", "已打断当前等待，马上带上你说的" if waiting
+                              else "已记下，下一步带上")
             return
 
         if not self._ensure_brain():
@@ -383,6 +395,7 @@ class Viewer(ctk.CTk):
 
         self._running = True
         self._stop_evt.clear()
+        self._interrupt.clear()      # 清掉上一回合可能残留的打断信号
         self._step = 0
         self._set_buttons(busy=True)
         threading.Thread(target=self._agent, args=(text,), daemon=True).start()
@@ -554,17 +567,27 @@ class Viewer(ctk.CTk):
         return "（数据参考：" + "；".join(out) + "——**以你看到的两张图为准**）"
 
     def _wait(self, seconds: float) -> str:
-        """等待，但分成小片，这样停止按钮能立刻响应。
+        """等待，但分成小片，这样停止/插话能立刻响应。
 
-        上限见 MAX_WAIT。分片睡是为了让"停止"能秒响应——
-        哪怕模型让等 600 秒，你点停止也就 0.2 秒内结束，不会卡住整个界面。
+        上限见 MAX_WAIT。分片睡是为了能被打断——
+        哪怕模型让等 600 秒，你点停止或发一句话，0.2 秒内就结束。
         """
         seconds = max(0.0, min(MAX_WAIT, seconds))
         end = time.monotonic() + seconds
-        while time.monotonic() < end:
-            if self._stop_evt.is_set():
-                return f"等待中断（{seconds:.0f}s 未走完）"
-            time.sleep(WAIT_SLICE)
+        self._interrupt.clear()
+        self._waiting = True
+        try:
+            while time.monotonic() < end:
+                if self._stop_evt.is_set():
+                    return f"等待中断（{seconds:.0f}s 未走完）"
+                if self._interrupt.is_set():
+                    done = seconds - max(0.0, end - time.monotonic())
+                    self._interrupt.clear()
+                    return (f"等待被打断（原计划 {seconds:.0f}s，"
+                            f"实际等了 {done:.0f}s）——有人发话了，先看他说什么")
+                time.sleep(WAIT_SLICE)
+        finally:
+            self._waiting = False
         if seconds >= 60:
             return f"已等待 {seconds:.0f}s（约 {seconds / 60:.0f} 分钟）"
         return f"已等待 {seconds:.0f}s"

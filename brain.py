@@ -213,6 +213,10 @@ def init(base_url: str, api_key: str, model: str,
     base_url/api_key/model   OpenAI 兼容网关的三项配置
     json_mode                True 时要求网关返回 JSON 对象；某些网关不支持，
                              报错了就传 False（这时靠提示词约束 + 容错解析）
+
+    **不会清空对话历史**——想重开一段对话请显式调 reset()。
+    早先这里末尾会 reset()，而调用方每发一句话都要重新 init 一次，
+    结果模型每轮都从零开始、完全不记得上一轮干了什么（踩过）。
     """
     global _client, _model, _options
 
@@ -230,7 +234,6 @@ def init(base_url: str, api_key: str, model: str,
         "max_tokens": max_tokens,
         "json_mode": json_mode,
     }
-    reset()
     _log.info("配置模型：%s @ %s   json_mode=%s   日志→%s",
               model, base_url, json_mode, LOG_PATH)
 

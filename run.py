@@ -660,7 +660,12 @@ class Viewer(ctk.CTk):
         self.cfg_hint.configure(text="已加载保存的配置")
 
     def on_save_config(self) -> None:
-        """把当前填的三项存下来，下次启动自动读。"""
+        """把当前填的三项存下来，下次启动自动读。
+
+        **不动对话历史**——清历史只由「清空」按钮负责。
+        早先这里顺手 reset()，加上 init() 内部也 reset()，
+        导致每发一句话上下文就被清一次（踩过）。
+        """
         try:
             brain.save_config(self.base_url.get().strip(),
                               self.api_key.get().strip(),
@@ -669,9 +674,6 @@ class Viewer(ctk.CTk):
             self.cfg_hint.configure(text=f"保存失败：{exc}", text_color="#b3261e")
             return
         self.cfg_hint.configure(text="已保存", text_color="#2f8f5b")
-        # 配置变了，清掉对话历史，免得模型带着旧上下文跑
-        if not self._running:
-            brain.reset()
 
     def on_close(self) -> None:
         # 先发停止信号，免得模型线程还在跑

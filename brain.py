@@ -90,7 +90,11 @@ SYSTEM_PROMPT = """你是操作浏览器页面的助手。每次你会看到一�
   但**这些数据很不全**：页面内部区域的滚动、跨域 iframe 里的滚动、弹窗浮现、
   按钮变灰、视频开始播……它们统统看不出来。数据说"没变"时，**以你眼睛看到的为准**。
 
-只输出一个 JSON 对象，不要任何解释文字或代码块标记：
+输出格式（**严格遵守，多余的字符都会让整个动作作废**）：
+- 只输出一个 JSON 对象，不要解释文字、不要代码块标记、不要 <think> 之类的思考标签。
+- JSON 里每个值只写一对引号，别多写——`"thought":"看这里"` 是对的，
+  `"thought":" "看这里"`（多一个引号）会让整段无法解析，你的动作就白想了。
+- 格式如下：
 {"thought": "一句话说明你看到了什么、要做什么", "action": {动作}}
 
 可用动作：
@@ -495,30 +499,69 @@ def _parse(resp) -> Decision:
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     """从一堆文字里找出那个 JSON 对象。找不出来返回 None。
 
-    每一步失败都记日志：是"压根没有花括号"还是"有花括号但语法不对"，
-    这两者的修法完全不同（前者是提示词没用，后者往往是被截断或夹了注释）。
+    模型爱在外面包东西，见过的几种：
+    - ```json ... ``` 代码块
+    - `<think>推理过程</think><answer>{...}</answer>`（推理模型，GLM 新版就这样）
+    - 直接一段人话 + JSON
+
+    所以策略是**从最后一个 `{` 往前找配对的 `}`**，而不是要求整段就是 JSON。
+    失败时记日志：是"压根没有花括号"还是"有花括号但语法不对"，两者修法不同。
     """
     s = (text or "").strip()
     if not s:
         _log.warning("解析失败：返回是空的")
         return None
 
+    # 推理模型的思考段：先摘掉。它是模型自言自语，里面常带花括号，
+    # 留着会干扰下面的定位（实测 <think> 段里有「动作类型是click」这类内容）。
+    s = re.sub(r"<think\b[^>]*>.*?</think\s*>", " ", s, flags=re.S | re.I)
+    # <answer> 包裹：只取里面的内容（标签名各家不同，泛化处理）
+    m = re.search(r"<answer\b[^>]*>(.*?)</answer\s*>", s, flags=re.S | re.I)
+    if m:
+        s = m.group(1)
+
+    s = s.strip()
     # 去掉 ```json ... ``` 包裹
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
         s = re.sub(r"\s*```$", "", s).strip()
         _log.debug("剥掉代码块标记后剩 %d 字符", len(s))
 
-    start, end = s.find("{"), s.rfind("}")
-    if start < 0 or end <= start:
-        _log.warning("解析失败：文本里找不到成对的 { }（可能模型只说了人话没输出 JSON）")
-        return None
+    # 找 JSON 对象的范围：从第一个 { 开始，依次拿后面的 { 试。
+    # **顺序很关键——必须从最外层往里试**。JSON 里常有嵌套（action 就是个内层对象），
+    # 如果从最后一个 { 往前找，会先拿到内层对象：轻则白解析一次、日志里留下
+    # 一条吓人的"解析失败"（实测踩过），重则内层恰好是合法 JSON，于是返回了错的对象。
+    start = s.find("{")
+    end = s.rfind("}")
+    while start >= 0 and end > start:
+        obj = _try_load(s[start:end + 1])
+        if obj is not None:
+            return obj
+        start = s.find("{", start + 1)      # 这一段不成，从下一个 { 再试
 
-    chunk = s[start:end + 1]
+    _log.warning("解析失败：把所有 { 都试了一遍，没有一处是合法 JSON")
+    return None
+
+
+def _try_load(chunk: str) -> Optional[Dict[str, Any]]:
+    """试一次 json.loads，失败就试着修一下常见的模型手误。
+
+    模型写得最像又最不像 JSON 的一类毛病：**引号打多了**。
+    实测见过 `"thought":" "看到播放按钮..."` —— 冒号后多一个引号，
+    整段就少了个键值分隔，json.loads 报 "Expecting ',' delimiter"。
+    """
     try:
         obj = json.loads(chunk)
     except json.JSONDecodeError as exc:
-        _log.warning("解析失败：JSON 语法错误 → %s（截取片段 %d 字符，位置 %d）",
+        fixed = _fix_quotes(chunk)
+        if fixed is not None:
+            try:
+                obj = json.loads(fixed)
+                _log.warning("JSON 有引号错误，自动修复后解析成功（原错误：%s）", exc.msg)
+                return obj
+            except json.JSONDecodeError:
+                pass
+        _log.warning("解析失败：JSON 语法错误 → %s（片段 %d 字符，位置 %d）",
                      exc.msg, len(chunk), exc.pos)
         _log.debug("出错的片段：\n%s", chunk[:500])
         return None
@@ -527,3 +570,20 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
         _log.warning("解析失败：顶层不是对象，是 %s", type(obj).__name__)
         return None
     return obj
+
+
+def _fix_quotes(chunk: str) -> Optional[str]:
+    """修「值前面多打了一个引号」这种毛病：`:" "内容"` → `:" 内容"`。
+
+    实测见过的形态：模型想写 `"thought":" 看到按钮"`，手一抖写成
+    `"thought":" "看到按钮"` —— 值的位置变成了 `" "`，于是整段不再合法。
+
+    **只在已经非法的 JSON 上动手，且只删那一个多余引号**，不做任何别的猜测：
+    这个模式后面必须跟着实打实的内容（不是 `,` `}` 这类分隔符），
+    所以合法的 `""`、`" "` 都不会被误伤。修不了返回 None，
+    宁可报错也别自作聪明改，改坏了会变成"点错地方"这种更糟的问题。
+    """
+    fixed = re.sub(r'(:\s*"\s*)"(?=[^"\s,}\]:])', r"\1", chunk)
+    if fixed == chunk:
+        return None
+    return fixed

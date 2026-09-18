@@ -36,6 +36,34 @@ python run.py
 
 一个回合最多跑 50 步（`run.py` 里的 `MAX_STEPS`），防止模型停不下来。
 
+## 配置模型
+
+任何 **OpenAI 兼容**的接口都能用，三项配置在界面左侧填写。
+
+**接口地址只填到版本号那一层，不要带 `/chat/completions`** ——OpenAI 库会自己接上，
+多填就会拼成两遍（`…/v4/chat/completions/chat/completions`）导致 404，
+而服务端只会回一句 "Not Found"，很难看出是自己填错了。
+程序会自动去掉多余的这段并记一条警告，但还是填对最省事。
+
+| 服务 | 接口地址 | 说明 |
+|---|---|---|
+| 智谱 BigModel | `https://open.bigmodel.cn/api/paas/v4` | `glm-4v-flash` 免费 |
+| 深度求索 | `https://api.deepseek.com` | |
+| 硅基流动 | `https://api.siliconflow.cn/v1` | |
+| OpenRouter | `https://openrouter.ai/api/v1` | 免费模型每天 50 次 |
+
+**必须选能看懂图的模型**，纯文本模型跑不起来（每步都要读截图）。
+配置存在 `brain.config.json`，里面有密钥，已在 `.gitignore` 中排除。
+
+两点实测经验：
+
+- **推理模型能用，但费钱**。像 `glm-4.1v-thinking-flash` 这类会先输出一段
+  `<think>…</think>` 再给答案，程序能正确解析（会自动剥掉思考段），但那段思考
+  白花 token、还拖慢每步响应。能用非推理模型就别用推理模型。
+- **截图很吃 token**。每步要发两张图（上一屏 + 当前屏），1080×720 的图按
+  OpenAI 的视觉计费约 1100 token/张，一个 50 步的回合约 140k token 输入。
+  这是"由模型自己判断动作有没有生效"的代价，详见下一节。
+
 ## 对话区怎么用
 
 ```

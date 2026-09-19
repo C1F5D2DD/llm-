@@ -266,8 +266,12 @@ class Viewer(ctk.CTk):
         self.chat = ctk.CTkScrollableFrame(self.right, fg_color="#f7f8fa", corner_radius=8)
         self.chat.grid(row=1, column=0, sticky="nsew", padx=12, pady=4)
         self.chat.grid_columnconfigure(0, weight=1)
-        # 窗口拉宽/缩窄时重新给所有消息折行（宽度定死过一次，踩过）
-        self.chat.bind("<Configure>", self._on_chat_resize)
+        # 窗口拉宽/缩窄时重新给所有消息折行（宽度定死过一次，踩过）。
+        # **必须 add="+"**：CTkScrollableFrame 自己也绑了 <Configure> 用来更新
+        # canvas 的 scrollregion，bind 不带 add 会把它顶掉——内容照样长，但
+        # canvas 不知道，滚动范围永远是空的，结果整个对话区滚不动（实测踩过：
+        # 不绑=True、绑空的=False、绑 add+ =True，三方对照验证过）。
+        self.chat.bind("<Configure>", self._on_chat_resize, add="+")
 
         send_row = ctk.CTkFrame(self.right, fg_color="transparent")
         send_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 12))

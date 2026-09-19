@@ -553,8 +553,15 @@ class Viewer(ctk.CTk):
                     desc = f"已点击 ({int(action['x'])}, {int(action['y'])})"
                 elif t == "scroll":
                     n = int(action.get("notches", 3))
-                    wc.scroll(n)
+                    # 页面里各块区域各滚各的（学习通左边视频区、右边目录栏就是），
+                    # 模型可以指定往哪块滚；不给就滚整页（scroll 内部默认页面中间）
+                    sx = int(action.get("x", 0) or 0)
+                    sy = int(action.get("y", 0) or 0)
+                    note = wc.scroll(n, sx, sy)
                     desc = f"已滚动 {n:+d} 格"
+                    if sx or sy:
+                        desc += f"（在 {sx}, {sy} 这块区域上滚的）"
+                    desc += note      # 滚轮退化到直接滚动时会带一句说明
                 elif t == "drag":
                     wc.drag(int(action["x1"]), int(action["y1"]),
                             int(action["x2"]), int(action["y2"]))
@@ -731,7 +738,10 @@ def _action_text(action: Dict[str, Any]) -> str:
         return f"点击 ({action.get('x')}, {action.get('y')})"
     if t == "scroll":
         n = int(action.get("notches", 3))
-        return f"滚动 {n:+d} 格（{'向下' if n > 0 else '向上'}）"
+        where = ""
+        if action.get("x") or action.get("y"):
+            where = f" @ ({action.get('x')}, {action.get('y')})"
+        return f"滚动 {n:+d} 格（{'向下' if n > 0 else '向上'}）{where}"
     if t == "drag":
         return (f"拖动 ({action.get('x1')}, {action.get('y1')}) → ({action.get('x2')}, {action.get('y2')})")
     if t == "type":

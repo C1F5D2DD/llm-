@@ -112,21 +112,89 @@ _VIDEO_JS = """(() => {
 _PAGE_JS = """(() => {
   const de = document.documentElement, bd = document.body;
   const h = Math.max(de.scrollHeight, bd ? bd.scrollHeight : 0);
-  let inner = null, iframes = 0;
+  const VW = window.innerWidth, VH = window.innerHeight;
+  let iframes = 0;
   for (const f of document.querySelectorAll('iframe')) {
     const r = f.getBoundingClientRect();
     if (r.width > 200 && r.height > 200) iframes++;      // 小的是埋点框，不算
   }
+
+  // 找出"自己能滚、而且现在还看得见"的区域。
+  // 两点很关键：
+  // 1. 坐标必须夹进视口——元素中心可能在屏幕外，模型照抄就点到别处了
+  //    （实测报过 (1357, 455)，而视口只有 1075 宽）
+  // 2. 页面上往往有好几块这样的区域（学习通左边视频区、右边目录栏各滚各的），
+  //    只报一块的话模型没法选，想滚右边却滚了整页
+  const inners = [];
   for (const el of document.querySelectorAll('div,main,section,ul,ol')) {
     const sh = el.scrollHeight, ch = el.clientHeight;
-    if (ch > 300 && sh - ch > 200 && sh > (inner ? inner.sh : 0)) {
-      const r = el.getBoundingClientRect();
-      inner = {sh: sh, ch: ch, top: Math.round(el.scrollTop),
-               x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)};
-    }
+    const left = sh - ch - Math.round(el.scrollTop);      // 还能往下滚多少
+    if (ch < 150 || left < 100) continue;
+    const r = el.getBoundingClientRect();
+    const x0 = Math.max(0, r.left), x1 = Math.min(VW, r.right);
+    const y0 = Math.max(0, r.top), y1 = Math.min(VH, r.bottom);
+    if (x1 - x0 < 120 || y1 - y0 < 120) continue;         // 露出来太少，滚了也不准
+    inners.push({left: left, x: Math.round((x0 + x1) / 2), y: Math.round((y0 + y1) / 2)});
   }
-  return JSON.stringify({h: h, vw: window.innerWidth, vh: window.innerHeight,
-                         y: Math.round(window.scrollY), inner: inner, iframes: iframes});
+  inners.sort((a, b) => b.left - a.left);
+  const keep = [];                                        // 同一块区域会被内外层重复报，去重
+  for (const it of inners) {
+    if (!keep.some(k => Math.abs(k.x - it.x) < 60 && Math.abs(k.y - it.y) < 60)) keep.push(it);
+    if (keep.length >= 3) break;
+  }
+  return JSON.stringify({h: h, vw: VW, vh: VH, y: Math.round(window.scrollY),
+                         inners: keep, iframes: iframes});
+})()"""
+
+
+# 直接改 DOM 的滚动位置。用在"滚轮发不出去"的时候当后路。
+# 为什么需要它：页面处于 hidden（窗口被隐藏/挪到屏幕外、被遮挡）时，
+# Chromium 会停掉合成器，**mouseWheel 事件永远等不到回执**——实测挂满 15 秒超时，
+# 而 eval/截图不走合成器所以一切正常，症状特别有迷惑性（表现为"滚不动"）。
+# 这里从给定坐标往上找第一个能滚的元素来滚，所以"右边小组件"也能滚得动；
+# 找不到就滚整页；顺带钻同源 iframe。
+_SCROLL_JS = """(() => {
+  const D = %d, X = %d, Y = %d;
+  function tryScroll(doc, x, y) {
+    let cur = null;
+    try { cur = doc.elementFromPoint(x, y); } catch (e) { return null; }
+    while (cur) {
+      const oy = doc.defaultView.getComputedStyle(cur).overflowY || '';
+      const can = (cur.scrollHeight - cur.clientHeight) > 4;
+      if (can && (oy === 'auto' || oy === 'scroll' || oy === 'overlay')) {
+        const before = cur.scrollTop;
+        cur.scrollTop = before + D;
+        if (Math.abs(cur.scrollTop - before) >= 1) {
+          return {how: cur.tagName + '.' + String(cur.className || '').slice(0, 24),
+                  top: Math.round(cur.scrollTop)};
+        }
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  function visit(doc, x, y, depth) {
+    if (!doc || depth > 6) return null;
+    let el = null;
+    try { el = doc.elementFromPoint(x, y); } catch (e) { return null; }
+    if (el && el.tagName === 'IFRAME') {
+      try {
+        const r = el.getBoundingClientRect();
+        const inner = el.contentDocument;
+        if (inner) {
+          const got = visit(inner, x - r.left, y - r.top, depth + 1);
+          if (got) return got;
+        }
+      } catch (e) {}
+    }
+    return tryScroll(doc, x, y);
+  }
+  const got = visit(document, X, Y, 0);
+  if (got) return JSON.stringify(got);
+  const before = window.scrollY;
+  window.scrollBy(0, D);
+  return JSON.stringify({how: 'page', top: Math.round(window.scrollY),
+                         ok: Math.abs(window.scrollY - before) >= 1});
 })()"""
 
 
@@ -395,14 +463,21 @@ def drag(x1: int, y1: int, x2: int, y2: int, steps: int = 10,
         time.sleep(settle)
 
 
-def scroll(notches: int, x: int = 0, y: int = 0, settle: float = 0.3) -> None:
-    """滚轮，正数向下滚。
+def scroll(notches: int, x: int = 0, y: int = 0, settle: float = 0.3) -> str:
+    """滚轮，正数向下滚。返回一句话说明实际怎么滚的（给界面/模型看）。
 
     直接用 dispatchMouseEvent 的 mouseWheel——带 deltaY 就是滚轮语义。
     比 synthesizeScrollGesture 好：那个是模拟手势，会真的去挪系统光标。
 
     x/y 是滚动发生的坐标（和 click 一样，按截图刻度填；0 就是不指定 = 页面中间）。
-    有些页面只在特定区域响应滚动，比如侧边栏和主内容区是分开滚的。
+    **页面里各块区域是各滚各的**，比如学习通左边视频区、右边目录栏是两个独立的
+    滚动容器：想让目录栏滚，就必须把指针放到目录栏上再滚。
+
+    两种情况会退化到"直接改 DOM 滚动位置"（见 _SCROLL_JS 的说明）：
+    - 页面报 hidden：这时 Chromium 停了合成器，滚轮发出去也永远没有回执，
+      硬等只会卡住十几秒
+    - 滚轮发出去了但超时：同上，兜一下
+    返回值里会写明是哪种方式，方便排查"为什么滚了没反应"。
     """
     cdp = _require()
     if not x and not y:
@@ -410,15 +485,52 @@ def scroll(notches: int, x: int = 0, y: int = 0, settle: float = 0.3) -> None:
         w = cdp.eval("innerWidth") or 1
         h = cdp.eval("innerHeight") or 1
         x, y = int(w // 2), int(h // 2)
+    x, y = int(x), int(y)
+    delta = _SCROLL_STEP * int(notches)
 
-    cdp.call("Input.dispatchMouseEvent", {
-        "type": "mouseWheel",
-        "x": int(x), "y": int(y),
-        "deltaX": 0,
-        "deltaY": _SCROLL_STEP * int(notches),   # 正数 = 向下滚
-    })
+    # 页面不可见时别去试滚轮——那是个必挂的死路（实测等满 15 秒）
+    vis = ""
+    try:
+        vis = str(cdp.eval("document.visibilityState") or "")
+    except WindowError:
+        pass
+
+    if vis == "visible":
+        # 先把指针移过去（悬停到位），再滚——有些页面要指针真在区域上才认滚轮
+        cdp.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y,
+                                              "button": "none", "clickCount": 0})
+        time.sleep(0.03)
+        try:
+            cdp.call("Input.dispatchMouseEvent", {
+                "type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": delta,
+            }, timeout=2.5)
+            if settle:
+                time.sleep(settle)
+            return ""
+        except WindowError:
+            why = "滚轮没回执"
+    else:
+        why = "页面不可见（滚轮发不出去）"
+
+    note = _js_scroll(cdp, x, y, delta, why)
     if settle:
         time.sleep(settle)
+    return note
+
+
+def _js_scroll(cdp: "_CDP", x: int, y: int, delta: int, why: str) -> str:
+    """退路：直接改 DOM 里的滚动位置。返回一句说明，附上退化的原因。"""
+    try:
+        raw = cdp.eval(_SCROLL_JS % (delta, x, y))
+        d = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        return f"（{why}，直接滚动也失败了：{exc}）"
+    if not isinstance(d, dict):
+        return f"（{why}，直接滚动没有返回结果）"
+    how = d.get("how", "?")
+    if how == "page":
+        return f"（{why}，改为直接滚整页，现在 {d.get('top')}px）"
+    return f"（{why}，改为直接滚 {how}，现在 {d.get('top')}px）"
 
 
 def type_text(text: str, settle: float = 0.2) -> None:
@@ -637,13 +749,23 @@ def page_info() -> str:
     else:
         parts.append("顶层文档只有一屏（不代表页面上没有更多内容）")
 
-    inner = d.get("inner")
-    if isinstance(inner, dict):
-        left = max(0, int(inner.get("sh") or 0) - int(inner.get("ch") or 0)
-                   - int(inner.get("top") or 0))
-        if left > 100:
-            parts.append(f"中间还有一块自己的滚动区（可滚 {left}px 没到底），"
-                         f"要在它里面滚就把坐标写到 ({inner.get('x')}, {inner.get('y')})")
+    inners = d.get("inners")
+    if isinstance(inners, list) and inners:
+        vw = int(d.get("vw") or 0)
+        desc = []
+        for it in inners[:3]:
+            try:
+                left = int(it.get("left") or 0)
+                ix, iy = int(it.get("x") or 0), int(it.get("y") or 0)
+            except (TypeError, ValueError):
+                continue
+            if left < 100:
+                continue
+            desc.append(f"({ix}, {iy}) 处那块还能滚 {left}px")
+        if desc:
+            parts.append("页面上有独立的滚动区（**各自滚各自的**，"
+                         "要滚哪块就把 scroll 的 x/y 写到那块的坐标上）："
+                         + "；".join(desc))
     return "；".join(parts)
 
 

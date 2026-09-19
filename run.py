@@ -172,6 +172,8 @@ class Viewer(ctk.CTk):
         self._waiting = False       # 是否正卡在 wait 里（决定插话时提示哪句话）
         self._scroll_pending = False  # 已排了一个滚动回调，别重复排
         self._chat_h = 0            # 对话区已占高度（px），超 CHAT_MAX_PX 就丢老的
+        self._wrap_cur = 0          # 当前用的折行宽度，跟新算出来的一样就不折腾
+        self._wrap_pending = False  # 已排了一个重新折行的回调
 
         # ---- 左栏下方：控制面板 ----
         self.panel = ctk.CTkFrame(self.left, corner_radius=16, fg_color="#83a2eb",
@@ -264,6 +266,8 @@ class Viewer(ctk.CTk):
         self.chat = ctk.CTkScrollableFrame(self.right, fg_color="#f7f8fa", corner_radius=8)
         self.chat.grid(row=1, column=0, sticky="nsew", padx=12, pady=4)
         self.chat.grid_columnconfigure(0, weight=1)
+        # 窗口拉宽/缩窄时重新给所有消息折行（宽度定死过一次，踩过）
+        self.chat.bind("<Configure>", self._on_chat_resize)
 
         send_row = ctk.CTkFrame(self.right, fg_color="transparent")
         send_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 12))
@@ -284,32 +288,117 @@ class Viewer(ctk.CTk):
         self.after(100, self.refresh)
 
     # ---------- 对话区 ----------
-    def _say(self, kind: str, text: str) -> None:
-        """往对话区追加一条。必须在主线程调用。
+    def _chat_wrap(self) -> int:
+        """对话区里一条消息的折行宽度（**逻辑像素**，直接喂给 CTkLabel）。
 
-        两个坑都踩过，这里一起说明：
-        1. **必须限高**：控件堆到 tkinter 的坐标上限（约 32767px）之后，
-           新消息画不出来，整个对话区看着是空的。
-        2. **不能用 grid 行号**：grid 的 row 必须唯一且连续，丢掉最早那条之后
-           就得把剩下的全部重排一遍——那是 O(n) 每条消息，几百条就卡死了
-           （实测）。pack 按加入顺序排，丢最早的不影响其它，天然 O(1)。
+        两个坑都在这里踩过，所以写得啰嗦一点：
+
+        1. **CTkLabel 会把 wraplength 按显示缩放再乘一遍**。屏幕 150% 缩放时，
+           传 500 实际折行在 750——按物理像素算出来的宽度传进去，文字要跑到
+           屏幕外才折行，看着就是被右边缘切掉（实测踩过）。所以这里量到物理
+           宽度后要**除以缩放系数**转成逻辑像素。winfo_* 给的是物理像素，
+           而 CTkImage/wraplength 这类是逻辑像素，这是本项目第 N 次栽在这上面。
+
+        2. **必须每次按当前宽度现算**，不能建消息时定死：布局还没完成时
+           winfo_width() 返回 1，定死的话所有消息都按同一宽度折行，拉宽窗口
+           也不跟着变。
         """
-        prefix, color, bold = _STYLE.get(kind, _STYLE["note"])
-        font = ("Microsoft YaHei", 12, "bold") if bold else ("Microsoft YaHei", 12)
-        wrap = max(200, self.chat.winfo_width() - 24)
-        lbl = ctk.CTkLabel(self.chat, text=f"{prefix}  {text}", anchor="w", justify="left",
-                           wraplength=wrap, font=font, text_color=color)
-        lbl.pack(fill="x", padx=6, pady=2, anchor="w")
+        try:
+            outer = self.chat.winfo_width()      # 物理像素
+        except Exception:
+            outer = 0
+        if outer <= 50:
+            return 200          # 布局没完成，先给个保守值；布局好了会重算
 
-        # 按累计高度丢老消息。用控件自己报的请求高度累加，
-        # 不去问布局（winfo_reqheight 要等重排，取到的是旧值）。
-        self._chat_h += max(0, lbl.winfo_reqheight())
+        sb = 0
+        bar = getattr(self.chat, "_scrollbar", None)
+        if bar is not None:
+            try:
+                sb = bar.winfo_width()
+            except Exception:
+                sb = 0
+        if sb <= 1:
+            sb = 16 * self._sc()      # 滚动条还没画出来，按经验预留
+
+        # 减去两侧留白（pack 的 padx=6×2）和滚动条，再换成逻辑像素
+        avail = outer - 12 - sb - 8
+        return max(120, int(avail / self._sc()))
+
+    def _sc(self) -> float:
+        """当前显示缩放系数（150% 缩放时是 1.5）。拿不到就按 1.0 算。"""
+        try:
+            return max(1.0, float(ctk.ScalingTracker.get_widget_scaling(self)))
+        except Exception:
+            return 1.0
+
+    def _chat_trim(self) -> None:
+        """按高度上限丢掉最早的消息。
+
+        不丢的话会一路堆到 tkinter 的坐标上限（约 32767px），之后的消息
+        画不出来，整个对话区看着是空的（实测踩过）。
+        """
         kids = self.chat.winfo_children()
         while len(kids) > 1 and self._chat_h > CHAT_MAX_PX:
             oldest = kids[0]
             self._chat_h -= max(0, oldest.winfo_reqheight())
             oldest.destroy()
             kids = self.chat.winfo_children()
+
+    def _on_chat_resize(self, _event=None) -> None:
+        """对话区尺寸变了就重新折行。
+
+        拖动窗口会连续触发 Configure，所以节流一下——几百条消息全部重设
+        wraplength 并重新量高度是有开销的。
+        """
+        if self._closing or self._wrap_pending:
+            return
+        self._wrap_pending = True
+
+        def do():
+            self._wrap_pending = False
+            if self._closing:
+                return
+            wrap = self._chat_wrap()
+            if wrap == self._wrap_cur:
+                return
+            self._wrap_cur = wrap
+            kids = self.chat.winfo_children()
+            for lbl in kids:
+                try:
+                    lbl.configure(wraplength=wrap)
+                except Exception:
+                    pass
+            # 折行变了，每条的高度也跟着变，重新累计并裁掉超出的
+            self._chat_h = sum(max(0, w.winfo_reqheight()) for w in kids)
+            self._chat_trim()
+
+        self.after(120, do)
+
+    def _say(self, kind: str, text: str) -> None:
+        """往对话区追加一条（带时间戳）。必须在主线程调用。
+
+        三个坑都踩过，一起说明：
+        1. **必须限高**：控件堆到 tkinter 的坐标上限（约 32767px）之后，
+           新消息画不出来，整个对话区看着是空的。
+        2. **不能用 grid 行号**：grid 的 row 必须唯一且连续，丢掉最早那条之后
+           就得把剩下的全部重排一遍——那是 O(n) 每条消息，几百条就卡死了
+           （实测）。pack 按加入顺序排，丢最早的不影响其它，天然 O(1)。
+        3. **折行宽度要现算**，见 _chat_wrap。
+        """
+        prefix, color, bold = _STYLE.get(kind, _STYLE["note"])
+        font = ("Microsoft YaHei", 12, "bold") if bold else ("Microsoft YaHei", 12)
+        wrap = self._chat_wrap()
+        self._wrap_cur = wrap
+        stamp = time.strftime("%H:%M:%S")
+        lbl = ctk.CTkLabel(self.chat, text=f"{stamp}  {prefix}  {text}",
+                           anchor="w", justify="left",
+                           wraplength=wrap, font=font, text_color=color)
+        lbl.pack(fill="x", padx=6, pady=2, anchor="w")
+
+        # 按累计高度丢老消息。用控件自己报的请求高度累加，
+        # 不去问布局（winfo_reqheight 要等重排，取到的是旧值）。
+        self._chat_h += max(0, lbl.winfo_reqheight())
+        self._chat_trim()
 
         self._scroll_bottom()
 

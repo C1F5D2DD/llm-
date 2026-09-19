@@ -478,6 +478,11 @@ def scroll(notches: int, x: int = 0, y: int = 0, settle: float = 0.3) -> str:
       硬等只会卡住十几秒
     - 滚轮发出去了但超时：同上，兜一下
     返回值里会写明是哪种方式，方便排查"为什么滚了没反应"。
+
+    实现上**先试滚轮、失败再退**，不去看 document.visibilityState：
+    那个信号不可靠（实测同一个 hidden 状态下，滚轮有时 0.1 秒就回来、
+    有时永远不回来），拿它当判据会白白错过能用滚轮的时候——真滚轮能触发
+    页面的 wheel 事件（懒加载之类要靠它），比直接改 scrollTop 更保真。
     """
     cdp = _require()
     if not x and not y:
@@ -488,31 +493,23 @@ def scroll(notches: int, x: int = 0, y: int = 0, settle: float = 0.3) -> str:
     x, y = int(x), int(y)
     delta = _SCROLL_STEP * int(notches)
 
-    # 页面不可见时别去试滚轮——那是个必挂的死路（实测等满 15 秒）
-    vis = ""
+    # 先把指针移过去（悬停到位），再滚——有些页面要指针真在区域上才认滚轮
+    cdp.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y,
+                                          "button": "none", "clickCount": 0})
+    time.sleep(0.03)
+    # 正常情况滚轮几十毫秒就回来；回不来就是回不来了（实测能挂满 15 秒），
+    # 所以超时给短一点，早点走退路，别让模型干等
     try:
-        vis = str(cdp.eval("document.visibilityState") or "")
+        cdp.call("Input.dispatchMouseEvent", {
+            "type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": delta,
+        }, timeout=1.5)
+        if settle:
+            time.sleep(settle)
+        return ""
     except WindowError:
         pass
 
-    if vis == "visible":
-        # 先把指针移过去（悬停到位），再滚——有些页面要指针真在区域上才认滚轮
-        cdp.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y,
-                                              "button": "none", "clickCount": 0})
-        time.sleep(0.03)
-        try:
-            cdp.call("Input.dispatchMouseEvent", {
-                "type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": delta,
-            }, timeout=2.5)
-            if settle:
-                time.sleep(settle)
-            return ""
-        except WindowError:
-            why = "滚轮没回执"
-    else:
-        why = "页面不可见（滚轮发不出去）"
-
-    note = _js_scroll(cdp, x, y, delta, why)
+    note = _js_scroll(cdp, x, y, delta, "滚轮没回执")
     if settle:
         time.sleep(settle)
     return note
@@ -774,9 +771,12 @@ def page_info() -> str:
 def move_out() -> None:
     """把窗口挪到屏幕外。
 
-    注意：实测**挪走之后浏览器会停止渲染**，截图会卡在最后一帧不再更新
-    （早先以为挪到屏幕外能保持渲染，那是误判——当时页面本身在播动画）。
-    所以只在"暂时不需要画面"时用，别拿它当后台运行的方案。
+    **截图不受影响**：CDP 截图会强制出一帧，实测挪到屏幕外之后画面照常更新
+    （滚动一下再看，截到的内容确实变了）。点击也正常，所以挪到屏幕外挂着跑
+    是可行的——这也是"打游戏时后台跑"想要的效果。
+
+    只有一件事会变：文档进入 hidden，部分页面的合成器不再活跃，滚轮事件
+    可能等不到回执。这个交给 scroll() 自己处理（滚轮不通就改 scrollTop）。
     """
     hwnd = _live_hwnd()
     _restore()

@@ -236,9 +236,9 @@ class Viewer(ctk.CTk):
                                    font=("Microsoft YaHei", 11))
         self.status.grid(row=8, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 4))
 
-        # 开关：显示/隐藏浏览器窗口。
-        # 默认开——窗口本来就在屏幕上；关掉会挪到屏幕外，但那样浏览器会停止渲染，
-        # 画面就冻在最后一帧了，所以只在不需要画面时才关。
+        # 开关：显示/隐藏浏览器窗口。默认开。
+        # 关掉会把窗口挪到屏幕外——**截图不受影响**（CDP 截图强制出帧，实测
+        # 挪走后画面照常更新），所以想挂机打游戏时可以关掉藏起来。
         self.edge_on = ctk.BooleanVar(value=True)
         ctk.CTkSwitch(self.panel, text="显示浏览器窗口", variable=self.edge_on,
                       command=self.on_toggle).grid(
@@ -771,7 +771,7 @@ def main() -> int:
         # "小窗口里的完整页面"，而不是从大窗口裁一块出来。
         # 高度要加掉浏览器界面（标签栏+地址栏）占的那一截。
         wc.resize(VIEW_W + 16, VIEW_H + 95)
-        # 确保窗口是显示出来的：最小化/被遮住的窗口浏览器会停止渲染，截不到画面
+        # 先摆到屏幕上，尺寸/位置有个确定的起点；之后想藏起来可以用界面的开关
         wc.move_in()
         capture.init(pid)   # 截图通道（CDP）
         print("已接管，开始刷画面")

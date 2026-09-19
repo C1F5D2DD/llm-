@@ -593,12 +593,23 @@ class Viewer(ctk.CTk):
                 video = wc.video_info()
                 if video:
                     page = f"{page}；{video}" if page else video
+                # 目录里哪些任务点已完成——绿勾在截图里太小，模型容易看漏、
+                # 反复点已经做完的（实测踩过）
+                tasks = wc.tasks_info()
+                if tasks:
+                    page = f"{page}；{tasks}" if page else tasks
 
                 d = brain.decide(img, goal, extra=extra, page=page)
                 self._ui("ai", d.thought)
                 self._ui("act", _action_text(d.action))
 
                 t = d.action.get("type")
+                if t == "reply":
+                    # 模型在回答人。回完就结束这一回合，等人说下一句——
+                    # 不结束的话它答完会接着操作页面，等于没听人说话（实测踩过）。
+                    self._ui("ai", d.action.get("text", ""))
+                    self._ui("done", "已回话，回合结束（接着说就行）")
+                    break
                 if t == "finish":
                     self._ui("done", f"完成：{d.action.get('reason', '')}")
                     break
@@ -847,6 +858,8 @@ def _action_text(action: Dict[str, Any]) -> str:
         return f"完成：{action.get('reason', '')}"
     if t == "ask_human":
         return f"求助：{action.get('question', '')}"
+    if t == "reply":
+        return f"回话：{action.get('text', '')}"
     return str(action)
 
 

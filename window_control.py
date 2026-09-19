@@ -28,7 +28,7 @@ from typing import Optional
 
 __all__ = ["init", "find_hwnd", "click", "drag", "scroll",
            "type_text", "press_key", "page_state", "page_info", "video_info",
-           "move_out", "move_in", "resize", "WindowError"]
+           "tasks_info", "move_out", "move_in", "resize", "WindowError"]
 
 DEFAULT_PORT = 9222     # Edge 的调试端口，和 run.py 里启动时用的一致
 
@@ -195,6 +195,28 @@ _SCROLL_JS = """(() => {
   window.scrollBy(0, D);
   return JSON.stringify({how: 'page', top: Math.round(window.scrollY),
                          ok: Math.abs(window.scrollY - before) >= 1});
+})()"""
+
+
+# 学习通把"任务点已完成"写在 DOM 里（目录项里带 icon_Completed 这个类）。
+# 这件事**必须程序来读**：截图里那个绿勾只是个很小的图标，模型要逐条认它、
+# 还得跟左侧内容对上，很容易看漏，于是就反复去做已经做完的任务点
+# （实测踩过：用户连说两次"别重复完成已经完成的任务点"）。
+_TASKS_JS = """(() => {
+  const done = [], todo = [];
+  for (const el of document.querySelectorAll('div')) {
+    const cls = String(el.className || '');
+    if (cls.indexOf('posCatalog_select') < 0) continue;
+    // firstLayer 是章节标题（"1 课程引入"这种分组），不是任务点——别把它们
+    // 当成"未完成的任务点"报给模型，否则它会去点标题。
+    if (cls.indexOf('firstLayer') >= 0) continue;
+    const txt = (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
+    if (txt.length < 3) continue;
+    const icon = el.querySelector('[class*="icon_"]');
+    const completed = !!icon && String(icon.className).indexOf('Completed') >= 0;
+    (completed ? done : todo).push(txt);
+  }
+  return JSON.stringify({done: done, todo: todo});
 })()"""
 
 
@@ -707,6 +729,42 @@ def video_info() -> str:
         return "；".join(parts)
     except Exception:
         return ""
+
+
+def tasks_info() -> str:
+    """课程目录里哪些任务点已经完成、哪些还没做。读不到就返回空串。
+
+    **这是程序替模型"看准"的第二件事**（第一件是视频状态）：目录里那个绿勾
+    在截图里只是个小图标，模型逐条认容易看漏，于是就反复点已经做完的任务点。
+    学习通把状态写在 `icon_Completed` 这个类上，读它比看图可靠得多。
+
+    返回形如「已完成 41 项（1.1 课程简介、1.2 …）；未完成 3 项（3.1 …）」。
+    """
+    try:
+        raw = _require().eval(_TASKS_JS)
+        d = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return ""
+    if not isinstance(d, dict):
+        return ""
+    done = d.get("done") if isinstance(d.get("done"), list) else []
+    todo = d.get("todo") if isinstance(d.get("todo"), list) else []
+    if not done and not todo:
+        return ""
+
+    def brief(items) -> str:
+        head = "、".join(str(x) for x in items[:6])
+        more = f" 等 {len(items)} 项" if len(items) > 6 else ""
+        return head + more
+
+    parts = []
+    if todo:
+        parts.append(f"**还没完成 {len(todo)} 项**：{brief(todo)}")
+    else:
+        parts.append("目录里已经没有未完成的项了")
+    if done:
+        parts.append(f"已经完成 {len(done)} 项（{brief(done)}）——**别再去点它们**")
+    return "；".join(parts)
 
 
 def page_info() -> str:

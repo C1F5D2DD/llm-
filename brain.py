@@ -22,6 +22,7 @@ import io
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
 
@@ -181,12 +182,18 @@ SYSTEM_PROMPT = """你是操作浏览器页面的助手。每次你会看到一�
 3. **每步对比两屏图，自己判断上一步生效没有**。程序给的那几个数字只是参考。
 4. **同一个动作绝对不能输出两次**。如果对比下来画面没变化，说明那个动作没用，
    这次必须换个完全不同的做法：改滚动（换滚动位置、换滚动区）、改坐标
-   （换到元素真正的中心）、或者 ask_human。
+   （换到元素真正的中心）、刷新、或者 ask_human。但是如果时间再深夜，就绝对不要ask_human，先换个动作试试。
 5. 连续 2 次没效果就 ask_human，别硬试到步数上限。
 6. 遇到登录页、验证码、滑块验证、短信验证，一律 ask_human，不要自己乱试。
 7. 不要做不可逆操作（提交、发布、删除、支付、退出登录），除非目标明确要求。
 8. 页面还在加载（空白、转圈）时就 wait，别乱点。
-9. thought 保持一句话。"""
+9. 务必非常非常仔细地核实视频是否开始.如果没有开始就进行长等待，会白白浪费相当多的时间。一定要进行至少3次短等待核验，完全确定视频开始播放再进入长等待。
+10. **用时间判断该不该继续等**：每步都会告诉你当前时间和距上一步过了多久，
+    历史里每条前面也有 [时:分:秒]。据此算清楚"这件事已经耗了多久"——
+    如果同一件事反复没进展、累计已经过去很久（比如等了好几轮、加起来超过十几分钟
+    页面还是老样子），**不要再机械地等下去**：该刷新（reload）、该换办法、
+    或者 ask_human 让人看看。别把"再等一次"当成默认选项。
+11. thought 保持一句话。"""
 
 
 class BrainError(RuntimeError):
@@ -209,6 +216,12 @@ _client = None
 _model = ""
 _options: Dict[str, Any] = {}
 _history: List[Dict[str, str]] = []
+
+# 时间线。**模型自己看不到时钟**——不给它时间，"再等 10 分钟"这种决策就没有参照：
+# 它不知道已经等了几轮、也不知道距上一步过了多久，于是一轮接一轮地重复等待，
+# 每次都以为是第一次（实测：连续两轮各等 580 秒，中间被人打断，模型毫无察觉）。
+_last_step_at: Optional[float] = None     # 上一步发生的时刻（time.time()）
+_turn_started: Optional[float] = None     # 本段对话的起点，用来算"一共跑了多久"
 
 # 上一步那张截图（data URI）。每步连同当前屏一起发给模型，
 # 让它自己对比两屏来判断动作有没有生效——这是模型的判断，不该由程序代劳：
@@ -313,9 +326,11 @@ def _clean_base_url(url: str) -> str:
 
 def reset() -> None:
     """清空对话历史。换任务时调用，免得模型被上一个任务的上下文带偏。"""
-    global _last_frame
+    global _last_frame, _last_step_at, _turn_started
     _history.clear()
     _last_frame = None      # 新任务的第一步不该看到上一个任务留下的画面
+    _last_step_at = None
+    _turn_started = None    # 时间线也重开，免得它拿旧对话的时间做判断
 
 
 def decide(img: Image.Image, goal: str, extra: str = "", page: str = "") -> Decision:
@@ -336,10 +351,17 @@ def decide(img: Image.Image, goal: str, extra: str = "", page: str = "") -> Deci
 
     失败抛 BrainError。
     """
-    global _last_frame
+    global _last_frame, _turn_started
 
     if _client is None:
         raise BrainError("还没配置，先调用 init(base_url, api_key, model)")
+
+    now = time.time()
+    if _turn_started is None:
+        _turn_started = now      # 本段对话的第一步，记下来算总时长
+    # 注意：**这里不要动 _last_step_at**。它在 note_result() 里更新（动作执行完的时刻）。
+    # 早先在这里也赋了一次，结果每次构建提示词前刚把"上一步时刻"改成当前时刻，
+    # "距上一步已过 N 秒"永远是 0——时间信息形同虚设（实测踩过）。
 
     _ensure_log()
     data_uri = _to_data_uri(img)
@@ -365,11 +387,13 @@ def decide(img: Image.Image, goal: str, extra: str = "", page: str = "") -> Deci
     decision = _parse(reply)
 
     # 记进历史：只留文本，不带图，省钱（图靠上面 _last_frame 单独传一张）
-    _history.append({"role": "user", "content": text})
+    # 每条前面加 [时:分:秒]——模型看不到时钟，不给它时间戳，它就不知道
+    # 上一步是多久以前的，也就没法判断"是不是卡太久了"。
+    _history.append({"role": "user", "content": f"[{_hhmmss(now)}] {text}"})
     _history.append({"role": "assistant",
-                     "content": json.dumps({"thought": decision.thought,
-                                            "action": decision.action},
-                                           ensure_ascii=False)})
+                     "content": f"[{_hhmmss(now)}] " + json.dumps(
+                         {"thought": decision.thought, "action": decision.action},
+                         ensure_ascii=False)})
     del _history[:-MAX_HISTORY * 2]
 
     _last_frame = data_uri      # 这一步的屏幕，成为下一步的"上一屏"
@@ -385,9 +409,13 @@ def note_result(result: str) -> None:
     调用方在每次 decide() 执行完动作后调一次，把结果描述传进来，比如
     "已点击 (300, 700)" 或 "执行失败：坐标超出范围"。
     """
+    global _last_step_at
     if not result:
         return
-    _history.append({"role": "user", "content": f"（上一步的执行结果）{result}"})
+    now = time.time()
+    _last_step_at = now          # 动作执行完的时刻，下一步据此算间隔
+    _history.append({"role": "user",
+                     "content": f"[{_hhmmss(now)}] （上一步的执行结果）{result}"})
     del _history[:-MAX_HISTORY * 2]
     _log.debug("记下执行结果：%s", result)
 
@@ -400,16 +428,49 @@ def _to_data_uri(img: Image.Image, quality: int = 80) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _hhmmss(t: float) -> str:
+    """给人/模型看的时刻。"""
+    return time.strftime("%H:%M:%S", time.localtime(t))
+
+
+def _gap_text(seconds: float) -> str:
+    """把秒数说成"1 分 30 秒"这种，别让模型自己去换算。"""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f} 秒"
+    if seconds < 3600:
+        return f"{seconds // 60:.0f} 分 {seconds % 60:.0f} 秒"
+    return f"{seconds // 3600:.0f} 小时 {seconds % 3600 // 60:.0f} 分"
+
+
+def _time_brief() -> str:
+    """当前时间 + 距上一步多久 + 这段对话一共跑了多久。"""
+    now = time.time()
+    parts = [f"现在时间：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}"]
+    if _last_step_at:
+        parts.append(f"距上一步（{_hhmmss(_last_step_at)}）已过 {_gap_text(now - _last_step_at)}")
+    if _turn_started:
+        parts.append(f"这段对话从 {_hhmmss(_turn_started)} 开始，"
+                     f"至今 {_gap_text(now - _turn_started)}")
+    return "；".join(parts)
+
+
 def _build_prompt(goal: str, extra: str, page: str = "", has_prev: bool = False) -> str:
     parts = [f"目标：{goal}"]
     if extra:
-        parts.append(f"人工指令（优先服从）：{extra}")
+        # 带上你说这话的时刻：模型据此判断"这是刚说的、还是十分钟前说的"，
+        # 后者意味着页面状态可能早就变了
+        parts.append(f"人工指令（优先服从，{_hhmmss(time.time())} 说的）：{extra}")
+    # 时间放在页面状况前面：模型做"还要等多久""是不是卡太久了"这类判断时
+    # 靠的就是它，别埋在长串页面数据后面
+    parts.append(_time_brief())
     if page:
         parts.append(f"页面状况（参考数据，不全，别只看它）：{page}")
     if has_prev:
         parts.append("下面两张图：先上一屏、后当前屏。**自己对比**，判断上一个动作有没有生效。")
     else:
         parts.append("（这是第一步，只有当前一屏）")
+    parts.append("（历史里每条前面的 [时:分:秒] 是那条发生的真实时间，可以据此判断过了多久）")
     parts.append("输出下一步动作的 JSON。")
     return "\n".join(parts)
 

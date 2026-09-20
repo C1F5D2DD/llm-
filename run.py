@@ -34,6 +34,17 @@ MAX_WAIT = 600.0        # 单次 wait 的上限（秒）。看视频要等很久
                         # 提示词里告诉模型的数字要和这里一致，否则它按 600 规划、程序只等 30
 WAIT_SLICE = 0.2         # wait 分片检查停止信号的间隔
 
+# 同一个动作在一次回合里最多做多少次，超了就强制停下整个回合。
+# 这是**程序层的熔断**，不靠模型自觉：提示词里早写了"同一个动作绝对不能输出两次"，
+# 实测压根拦不住——模型会十几二十次地重复同一个点击、同一个等待，把步数和时间
+# 全耗光。所以这里硬性计数，不指望它自己发现。
+# 计数按"动作签名"（类型 + 参数）算，同一个坐标点 15 次就会被掐掉；
+# 换个坐标、换个动作类型都算不同的调用，正常干活不会误伤。
+REPEAT_LIMIT = 15
+# 注意：**wait 不计入这个上限**。看长视频本来就要连着等很多次
+# （3 小时的课按每次 600 秒算要等 18 次），把 wait 也限死会把正常任务掐断。
+# 代价是真卡住时的空等拦不住——那个得靠界面上手动停，或者把上限调小。
+
 # 浏览器窗口的页面区域尺寸。网站会按这个尺寸自动排版，
 # 改这里就等于改"模型看到的页面布局"。
 VIEW_W = 1080
@@ -166,6 +177,9 @@ class Viewer(ctk.CTk):
         self._stop_evt = threading.Event()
         self._inbox: "queue.Queue[str]" = queue.Queue()
         self._step = 0
+        # 每个动作做了多少次（签名 -> 次数）。超 REPEAT_LIMIT 就掐掉整个回合，
+        # 见文件顶部那段说明。每个回合开始时清零。
+        self._repeat: Dict[str, int] = {}
         # 「插话打断等待」用：发消息时置上，让 _wait 立刻收工去处理你说的话。
         # 和 _stop_evt（结束整个回合）分开——插话只是想跳过剩余等待，不是要停。
         self._interrupt = threading.Event()
@@ -532,6 +546,7 @@ class Viewer(ctk.CTk):
         self._stop_evt.clear()
         self._interrupt.clear()      # 清掉上一回合可能残留的打断信号
         self._step = 0
+        self._repeat.clear()         # 重复计数也重开
         self._set_buttons(busy=True)
         threading.Thread(target=self._agent, args=(text,), daemon=True).start()
 
@@ -626,6 +641,20 @@ class Viewer(ctk.CTk):
                 if self._stop_evt.is_set():
                     self._ui("done", "已停止（这一步没执行）")
                     break
+
+                # 熔断：同一个动作做太多次就强制停。见文件顶部 REPEAT_LIMIT 的说明。
+                # wait 不计（看长视频本来就要连着等很多次）。
+                if t != "wait":
+                    sig = _action_sig(d.action)
+                    n = self._repeat.get(sig, 0) + 1
+                    self._repeat[sig] = n
+                    if n > REPEAT_LIMIT:
+                        self._ui("err", f"同一个动作（{_action_text(d.action)}）"
+                                        f"已经做了 {REPEAT_LIMIT} 次都没效果，判定卡住，"
+                                        f"停下整个回合")
+                        self._ui("note", "可以：换个说法重新下达目标、点「清空」重来，"
+                                         "或者自己看一眼页面卡在哪")
+                        break
 
                 result = self._exec(d.action)
                 self._ui("ok", result)
@@ -844,6 +873,39 @@ class Viewer(ctk.CTk):
         # refresh 是 after 循环，窗口销毁后还会再触发一次，这里标记一下让它停
         self._closing = True
         self.destroy()
+
+
+def _action_sig(action: Dict[str, Any]) -> str:
+    """给动作算一个"是不是同一件事"的签名，用来数重复次数。
+
+    按**类型 + 参数**算，不只看类型：
+    - 同一个坐标点 15 次 -> 算同一个动作，该掐
+    - 点了 15 个不同坐标 -> 是不同动作，不该掐（模型在认真找出路）
+    - 每次 wait 的秒数不同 -> 本来也不计入，这条只是保底
+
+    坐标取整到 10px：模型每次把坐标微调 1-2 像素（"这次点 520 试试，那次点 522"）
+    本质上还是同一个动作在原地磨，那种也该算重复。
+    """
+    t = str(action.get("type", "?"))
+    if t in ("click", "scroll", "drag"):
+        nums = []
+        for k in ("x", "y", "x1", "y1", "x2", "y2"):
+            v = action.get(k)
+            if v is not None:
+                try:
+                    nums.append(f"{k}={int(round(float(v) / 10.0))}")
+                except (TypeError, ValueError):
+                    pass
+        return f"{t}:{','.join(nums)}"
+    if t == "press":
+        return f"press:{action.get('key', '')}"
+    if t == "type":
+        # 打字看内容长度和开头就够，不用整段——目标不变时它会反复打同一串
+        s = str(action.get("text", ""))
+        return f"type:{len(s)}:{s[:20]}"
+    if t == "reload":
+        return "reload"
+    return t
 
 
 def _action_text(action: Dict[str, Any]) -> str:

@@ -27,8 +27,9 @@ from ctypes import wintypes
 from typing import Optional
 
 __all__ = ["init", "find_hwnd", "click", "drag", "scroll",
-           "type_text", "press_key", "page_state", "page_info", "video_info",
-           "tasks_info", "move_out", "move_in", "resize", "WindowError"]
+           "type_text", "press_key", "reload_page",
+           "page_state", "page_info", "video_info", "tasks_info",
+           "move_out", "move_in", "resize", "WindowError"]
 
 DEFAULT_PORT = 9222     # Edge 的调试端口，和 run.py 里启动时用的一致
 
@@ -645,6 +646,26 @@ def press_key(key: str, settle: float = 0.2) -> None:
     }
     cdp.call("Input.dispatchKeyEvent", params)
     cdp.call("Input.dispatchKeyEvent", {**params, "type": "keyUp"})
+    if settle:
+        time.sleep(settle)
+
+
+def reload_page(settle: float = 2.0) -> None:
+    """刷新当前页面。
+
+    用 Page.reload 而不是 `location.reload()` 再 eval 一次——后者在页面
+    开始跳转时那次 eval 会直接断掉，报一个看着像"连接挂了"的错（踩过）。
+    Page.reload 是导航命令，发出去就返回，不用等页面加载完。
+
+    settle 是留给页面开始加载的时间，别给太大：真等它加载完是模型该用
+    wait 干的事，这里只是让"刷新"这个动作有个确定的起点。
+    """
+    cdp = _require()
+    try:
+        cdp.call("Page.reload", {"ignoreCache": True}, timeout=5.0)
+    except WindowError:
+        # 有些版本不认 ignoreCache 之外的参数组合，退回不带参数再试一次
+        cdp.call("Page.reload", {}, timeout=5.0)
     if settle:
         time.sleep(settle)
 

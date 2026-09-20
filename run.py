@@ -232,7 +232,10 @@ class Viewer(ctk.CTk):
             side="left", fill="x", expand=True, padx=(0, 4))
         ctk.CTkButton(row2, text="↓ 下滚", height=28,
                       command=lambda: self.on_scroll(3)).pack(
-            side="left", fill="x", expand=True, padx=(4, 0))
+            side="left", fill="x", expand=True, padx=(4, 4))
+        # 刷新页面：模型也能自己刷（reload 动作），这个按钮是给人手动用的
+        ctk.CTkButton(row2, text="↻ 刷新", height=28, width=70,
+                      command=self.on_reload).pack(side="left", padx=(0, 0))
 
         self.status = ctk.CTkLabel(self.panel, text="", anchor="w",
                                    font=("Microsoft YaHei", 11))
@@ -485,6 +488,10 @@ class Viewer(ctk.CTk):
         if xy:
             self._run(lambda: wc.scroll(notches, *xy), f"已滚动 {notches:+d} 格 @ {xy}")
 
+    def on_reload(self):
+        """手动刷新页面。刷新有等待，放子线程免得卡界面。"""
+        self._run(wc.reload_page, "已刷新页面")
+
     def _run(self, fn, done_msg: str) -> None:
         """点击/滚动里有 sleep，放子线程跑，完成后回主线程更新状态。"""
         def work():
@@ -683,6 +690,10 @@ class Viewer(ctk.CTk):
 
             if t == "wait":
                 return self._wait(float(action.get("seconds", 3)))
+            if t == "reload":
+                before = wc.page_state()
+                wc.reload_page()
+                return "已刷新页面" + self._facts(before)
             return f"（{t} 没执行）"
         except Exception as exc:
             return f"执行失败：{exc}"
@@ -854,6 +865,8 @@ def _action_text(action: Dict[str, Any]) -> str:
         return f"按键 {action.get('key', 'Enter')}"
     if t == "wait":
         return f"等待 {action.get('seconds', 3)}s"
+    if t == "reload":
+        return "刷新页面"
     if t == "finish":
         return f"完成：{action.get('reason', '')}"
     if t == "ask_human":

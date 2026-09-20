@@ -28,7 +28,8 @@ from typing import Any, Dict, List, NamedTuple, Optional
 
 from PIL import Image
 
-__all__ = ["init", "decide", "reset", "note_result", "save_config", "load_config",
+__all__ = ["init", "decide", "reset", "note_result", "note_hint", "turn_elapsed",
+           "save_config", "load_config",
            "BrainError", "Decision", "ACTIONS", "LOG_PATH"]
 
 # 允许模型输出的动作类型。和执行层（window_control）的能力一一对应。
@@ -193,7 +194,11 @@ SYSTEM_PROMPT = """你是操作浏览器页面的助手。每次你会看到一�
     如果同一件事反复没进展、累计已经过去很久（比如等了好几轮、加起来超过十几分钟
     页面还是老样子），**不要再机械地等下去**：该刷新（reload）、该换办法、
     或者 ask_human 让人看看。别把"再等一次"当成默认选项。
-11. thought 保持一句话。"""
+11. 历史里可能出现「（程序提醒）你已经把某个动作做了 N 次」。**这时要自己判断**：
+    如果每次都能看到新东西（列表在往上翻、题目变了、进度在走），那重复是正常的，
+    接着做；如果画面一直没变、或者已经到底了，就立刻换做法。
+    别无视这个提醒继续机械重复——提醒过后还照旧，程序会把回合强制停掉。
+12. thought 保持一句话。"""
 
 
 class BrainError(RuntimeError):
@@ -420,6 +425,21 @@ def note_result(result: str) -> None:
     _log.debug("记下执行结果：%s", result)
 
 
+def note_hint(text: str) -> None:
+    """程序给模型塞一句提醒（不是动作结果，是程序的判断）。
+
+    用途：某个动作重复太多次时提醒它"是不是卡住了"。**只能提醒、不能替它停**——
+    "重复多少次算太多"跟具体任务有关（翻长列表滚 30 次很正常，点同一个按钮
+    3 次就可疑），程序分不清，得让模型结合画面自己判断。
+    """
+    if not text:
+        return
+    now = time.time()
+    _history.append({"role": "user", "content": f"[{_hhmmss(now)}] （程序提醒）{text}"})
+    del _history[:-MAX_HISTORY * 2]
+    _log.info("给模型的提醒：%s", text)
+
+
 # ---------------------------------------------------------------- 内部
 
 def _to_data_uri(img: Image.Image, quality: int = 80) -> str:
@@ -441,6 +461,16 @@ def _gap_text(seconds: float) -> str:
     if seconds < 3600:
         return f"{seconds // 60:.0f} 分 {seconds % 60:.0f} 秒"
     return f"{seconds // 3600:.0f} 小时 {seconds % 3600 // 60:.0f} 分"
+
+
+def turn_elapsed() -> float:
+    """这段对话一共跑了多少秒。还没开始过就返回 0。
+
+    给 run.py 用：提醒模型"这件事已经耗了多久"时要报这个数。
+    """
+    if not _turn_started:
+        return 0.0
+    return max(0.0, time.time() - _turn_started)
 
 
 def _time_brief() -> str:

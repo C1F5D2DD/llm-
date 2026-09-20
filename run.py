@@ -34,16 +34,18 @@ MAX_WAIT = 600.0        # 单次 wait 的上限（秒）。看视频要等很久
                         # 提示词里告诉模型的数字要和这里一致，否则它按 600 规划、程序只等 30
 WAIT_SLICE = 0.2         # wait 分片检查停止信号的间隔
 
-# 同一个动作在一次回合里最多做多少次，超了就强制停下整个回合。
-# 这是**程序层的熔断**，不靠模型自觉：提示词里早写了"同一个动作绝对不能输出两次"，
-# 实测压根拦不住——模型会十几二十次地重复同一个点击、同一个等待，把步数和时间
-# 全耗光。所以这里硬性计数，不指望它自己发现。
-# 计数按"动作签名"（类型 + 参数）算，同一个坐标点 15 次就会被掐掉；
-# 换个坐标、换个动作类型都算不同的调用，正常干活不会误伤。
-REPEAT_LIMIT = 15
-# 注意：**wait 不计入这个上限**。看长视频本来就要连着等很多次
-# （3 小时的课按每次 600 秒算要等 18 次），把 wait 也限死会把正常任务掐断。
-# 代价是真卡住时的空等拦不住——那个得靠界面上手动停，或者把上限调小。
+# 同一个动作重复太多次怎么办。**不能直接掐断**——"重复多少次算太多"跟任务
+# 有关：翻长列表往上滚 15 次完全正常（实测就是这么误伤过一次，模型在找第 1 题，
+# 被我的熔断中断了），而点同一个按钮 3 次就可疑。程序分不清，所以**先提醒模型，
+# 让它结合画面自己判断**，只有提醒过它还是照旧才真停下（兜底，防死循环）。
+#
+# 计数按"动作签名"（类型 + 参数）算，坐标取整到 10px——模型微调一两像素地
+# 原地磨也算重复。
+REPEAT_WARN = 15          # 普通动作：做这么多次就提醒
+REPEAT_STOP = 40          # 提醒过还是不停，才真停下
+REPEAT_WARN_SCROLL = 40   # 滚动/翻页：重复本来就是正常操作，阈值放宽很多
+REPEAT_STOP_SCROLL = 120
+# wait 完全不计数：看视频要连着等很多次（3 小时的课每次 600 秒要等 18 次）。
 
 # 浏览器窗口的页面区域尺寸。网站会按这个尺寸自动排版，
 # 改这里就等于改"模型看到的页面布局"。
@@ -642,19 +644,30 @@ class Viewer(ctk.CTk):
                     self._ui("done", "已停止（这一步没执行）")
                     break
 
-                # 熔断：同一个动作做太多次就强制停。见文件顶部 REPEAT_LIMIT 的说明。
-                # wait 不计（看长视频本来就要连着等很多次）。
+                # 重复动作：先提醒，提醒过还不改才真停下。
+                # 见文件顶部 REPEAT_WARN 那段说明——直接掐断会误伤正常的长列表翻页。
                 if t != "wait":
                     sig = _action_sig(d.action)
                     n = self._repeat.get(sig, 0) + 1
                     self._repeat[sig] = n
-                    if n > REPEAT_LIMIT:
+                    warn_at, stop_at = _repeat_limits(t)
+                    if n > stop_at:
                         self._ui("err", f"同一个动作（{_action_text(d.action)}）"
-                                        f"已经做了 {REPEAT_LIMIT} 次都没效果，判定卡住，"
-                                        f"停下整个回合")
+                                        f"做了 {n} 次，提醒过也没改，判定卡死，停下整个回合")
                         self._ui("note", "可以：换个说法重新下达目标、点「清空」重来，"
                                          "或者自己看一眼页面卡在哪")
                         break
+                    if n >= warn_at and n % warn_at == 0:
+                        mins = ""
+                        if brain.turn_elapsed() > 60:
+                            mins = f"这件事已经耗了约 {brain.turn_elapsed() / 60:.0f} 分钟。"
+                        brain.note_hint(
+                            f"你已经把「{_action_text(d.action)}」这个动作做了 {n} 次。{mins}"
+                            f"如果每次都能看到新内容（比如列表在往上翻、题目在变），"
+                            f"继续做没问题；但如果画面一直没变、或者已经到底了，"
+                            f"说明这个办法没用——换个做法（改坐标、改区域、刷新页面），"
+                            f"或者 ask_human 让人看看。")
+                        self._ui("note", f"这个动作已经做了 {n} 次，提醒模型换思路")
 
                 result = self._exec(d.action)
                 self._ui("ok", result)
@@ -873,6 +886,17 @@ class Viewer(ctk.CTk):
         # refresh 是 after 循环，窗口销毁后还会再触发一次，这里标记一下让它停
         self._closing = True
         self.destroy()
+
+
+def _repeat_limits(action_type: str) -> "tuple[int, int]":
+    """这个动作类型该在多少次时提醒、多少次时强制停。
+
+    滚动/翻页单独放宽：重复滚同一块区域本来就是正常操作（长列表要滚几十次），
+    用普通动作的阈值会误伤——实测就这么中断过一次正常的翻页找题。
+    """
+    if action_type in ("scroll", "drag"):
+        return REPEAT_WARN_SCROLL, REPEAT_STOP_SCROLL
+    return REPEAT_WARN, REPEAT_STOP
 
 
 def _action_sig(action: Dict[str, Any]) -> str:

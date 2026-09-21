@@ -372,6 +372,99 @@ def reset() -> None:
     _turn_started = None    # 时间线也重开，免得它拿旧对话的时间做判断
 
 
+def _ts_of(content: str) -> str:
+    """从历史条目开头取出 [HH:MM:SS]。取不到就返回 "??:??:??"。"""
+    m = re.match(r"\[([0-9:]{8})\]", str(content or ""))
+    return m.group(1) if m else "??:??:??"
+
+
+def _step_key(step: List[Dict[str, str]]) -> Optional[str]:
+    """给"一步"算签名，用来判断两步是不是同一件事。
+
+    一步的形态是：[user 目标] [assistant 动作] [user 执行结果]。
+    签名 = 动作类型+参数 + 结果文字。两步签名相同 = 同样的动作得到同样的结果，
+    那就是在原地打转，可以折叠。
+
+    只比较**动作**和**结果**，不比目标——目标一直没变是常态，
+    拿它当签名会让"换了动作"也被算成同一步。
+    """
+    if not step:
+        return None
+    act, res = None, None
+    for m in step:
+        c = m.get("content") or ""
+        if m.get("role") == "assistant":
+            act = c
+        elif "（上一步的执行结果）" in c:
+            res = c
+    if act is None and res is None:
+        return None
+    # 去掉时间戳再比：同一步在不同时刻做，本质还是同一步
+    strip = lambda s: re.sub(r"^\[[0-9:]{8}\]\s*", "", str(s or ""))
+    return f"{strip(act)}||{strip(res)}"
+
+
+def _project_history() -> List[Dict[str, str]]:
+    """把历史投影成**发给模型的样子**：连续重复的步骤折叠成一条。
+
+    原始 _history 一个字都不动（完整记录在内存和 runs/brain.log 里），
+    这里只影响模型看到什么——和 dsh 的 `surfaceOp: replace` 是同一个思路：
+    底层日志保留全量，surface（喂给模型的投影）可以压缩。
+
+    **为什么必须折叠**：学习通刷视频时模型会一轮轮地发"等待 600 秒"，结果
+    每次都是"视频还在播"。实测 77 轮就堆了 230 条历史、1.5 万 token，
+    把用户的要求稀释掉了——用户问"我的要求和你干的事一致吗"，模型答"一致"
+    （实际不一致，它自己在 thought 里都想明白了）。重复的上下文不仅浪费钱，
+    还会把关键信息淹掉。
+
+    为什么不学 dsh 用 LLM 摘要：这种重复是**确定性的**（同样的动作、同样的
+    结果），折叠是纯字符串操作，不该花一次模型调用。dsh 的 pruner 只按大小
+    剪（8192 字符），对"大量小重复"也无效。
+    """
+    if len(_history) < 6:
+        return list(_history)
+
+    # 先把历史切成"步"。一步从"目标"那条开始，到下一个"目标"之前结束。
+    steps: List[List[Dict[str, str]]] = []
+    cur: List[Dict[str, str]] = []
+    for m in _history:
+        c = m.get("content") or ""
+        if m.get("role") == "user" and "目标：" in c and cur:
+            steps.append(cur)
+            cur = []
+        cur.append(m)
+    if cur:
+        steps.append(cur)
+
+    out: List[Dict[str, str]] = []
+    i = 0
+    while i < len(steps):
+        key = _step_key(steps[i])
+        j = i + 1
+        if key is not None:
+            while j < len(steps) and _step_key(steps[j]) == key:
+                j += 1
+        n = j - i
+        if n >= 3:
+            # 重复够多：保留第一次的原文（模型能看清到底做了什么），
+            # 其余 N-1 次压成一行摘要
+            out.extend(steps[i])
+            t0 = _ts_of(steps[i][0].get("content", ""))
+            t1 = _ts_of(steps[j - 1][0].get("content", ""))
+            out.append({
+                "role": "user",
+                "content": (f"[{t0} → {t1}] （上面这一步**连续重复了 {n - 1} 次**，"
+                            f"动作和结果每次都完全相同，已折叠。"
+                            f"也就是说这期间页面没有任何进展——如果这是在等某个东西，"
+                            f"注意它已经等了 {n} 轮；如果是在点某个按钮，说明点了没用）"),
+            })
+            _log.debug("折叠了 %d 次重复步骤（%d 条压成 1 条）", n - 1, (n - 1) * len(steps[i]))
+        else:
+            out.extend(steps[i])
+        i = j
+    return out
+
+
 def decide(img: Image.Image, goal: str, extra: str = "", page: str = "",
            frame_age: float = 0.0) -> Decision:
     """看着当前画面决定下一步做什么。
@@ -411,8 +504,12 @@ def decide(img: Image.Image, goal: str, extra: str = "", page: str = "",
     data_uri = _to_data_uri(img)
     text = _build_prompt(goal, extra, page, has_prev=_last_frame is not None,
                          frame_age=frame_age)
-    _log.debug("请求：goal=%r extra=%r page=%r 图=%s 上一屏=%s 历史=%d 条",
-               goal, extra, page, img.size, "有" if _last_frame else "无", len(_history))
+    # 发给模型的是**投影**（连续重复的步骤已折叠），不是原始历史。
+    # 原始 _history 保持全量，日志里有完整记录。见 _project_history 的说明。
+    hist_view = _project_history()
+    _log.debug("请求：goal=%r extra=%r page=%r 图=%s 上一屏=%s 历史=%d 条（投影 %d 条）",
+               goal, extra, page, img.size, "有" if _last_frame else "无",
+               len(_history), len(hist_view))
 
     # 先给上一屏、再给当前屏，中间用文字说清楚哪个是哪个
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text}]
@@ -424,7 +521,7 @@ def decide(img: Image.Image, goal: str, extra: str = "", page: str = "",
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        *_history,                                        # 之前几步的文本记录
+        *hist_view,                                       # 之前几步的文本记录（已折叠重复）
         {"role": "user", "content": parts},
     ]
 
@@ -558,6 +655,9 @@ def _build_prompt(goal: str, extra: str, page: str = "", has_prev: bool = False,
     else:
         parts.append("（这是第一步，只有当前一屏）")
     parts.append("（历史里每条前面的 [时:分:秒] 是那条发生的真实时间，可以据此判断过了多久）")
+    parts.append("（历史里可能出现「连续重复了 N 次，已折叠」——那是程序把你之前的"
+                 "重复步骤合并了，因为动作和结果每次都完全一样。看到它就说明"
+                 "**你在这个动作上原地打转了很久**：换个做法，或者 ask_human。）")
     parts.append("输出下一步动作的 JSON。")
     return "\n".join(parts)
 

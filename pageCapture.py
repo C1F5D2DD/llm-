@@ -240,15 +240,27 @@ _ELEMENTS_JS = """(() => {
   return JSON.stringify(out);
 })()"""
 
-# 编号样式
-_BADGE_BG = (20, 110, 220, 235)      # 蓝底，和红色网格区分开
-_BADGE_FG = (255, 255, 255, 255)
+# 编号样式：**透明底 + 红框 + 红字**
+#
+# 早先用的是实心蓝底白字，问题是**挡住元素文字**：学习通目录里 "3.1 理论教学：…"
+# 这种条目，编号方块压在它左上角，正好盖住 "3.1"，模型看不清那是哪一节。
+# 改成镂空框后，底下的文字透出来，编号和内容都看得见。
+_BADGE_LINE = (210, 20, 20, 255)     # 红框
+_BADGE_TEXT = (210, 20, 20, 255)     # 红字
+_BADGE_FILL = (255, 255, 255, 90)    # 极淡的白底：只为了在深色背景上也读得清
 
 
 def _draw_badges(img, elements):
     """把编号画在图上，返回新图。
 
-    编号框贴在元素的左上角——放中心会挡住元素本身，模型就看不清它是什么了。
+    设计（都是踩出来的）：
+    1. **框放在元素的上边缘处，只露一半高度**（上半截在元素外、下半截压住元素顶部）。
+       这样框离元素最近、一眼能看出它标的是谁；压住的那点高度是元素的内边距
+       （文字不在最顶上），实测不会盖住文字。
+       早先整个框都放在元素外面，元素挨得近时框会贴到**上一个元素的文字**上，
+       反而更乱。
+    2. **透明底 + 红框 + 红字**：下面的内容透得出来。
+    3. **横向避让**：元素挨着时两个框会并排挤在一起，左右错开一点。
     """
     if not elements:
         return img
@@ -258,15 +270,41 @@ def _draw_badges(img, elements):
     layer = Image.new("RGBA", out.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
     font = _font(12)
+    W, H = out.size
+    occupied: list = []
+
+    def clash(x, y, bw, bh):
+        for ox, oy, ow in occupied:
+            if abs(x - ox) < max(bw, ow) and abs(y - oy) < bh + 1:
+                return True
+        return False
 
     for i, el in enumerate(elements, start=1):
         label = str(i)
-        tw = draw.textlength(label, font=font)
-        bw, bh = tw + 8, 16
-        x = max(0, min(out.size[0] - bw, int(el.get("l", 0))))
-        y = max(0, min(out.size[1] - bh, int(el.get("ty", 0))))
-        draw.rectangle([x, y, x + bw, y + bh], fill=_BADGE_BG)
-        draw.text((x + 4, y + 2), label, fill=_BADGE_FG, font=font)
+        bw = int(draw.textlength(label, font=font)) + 6
+        bh = 14
+        ex = int(el.get("l", 0))
+        ey = int(el.get("ty", 0))
+        ew = int(el.get("w", 40))
+
+        # 目标位置：元素上边缘，居中；框底边压进元素 6px
+        x0 = max(0, min(W - bw, ex + max(0, (ew - bw) // 2)))
+        y0 = max(0, ey - (bh - 6))
+
+        x, y = x0, y0
+        if clash(x, y, bw, bh):
+            for dx in (bw + 3, -(bw + 3), 2 * bw + 3, -(2 * bw + 3)):
+                nx = max(0, min(W - bw, x0 + dx))
+                if not clash(nx, y0, bw, bh):
+                    x, y = nx, y0
+                    break
+            else:
+                x, y = x0, y0        # 实在没位置就叠着，别跑远
+        occupied.append((x, y, bw))
+
+        draw.rectangle([x, y, x + bw, y + bh], fill=_BADGE_FILL,
+                       outline=_BADGE_LINE, width=1)
+        draw.text((x + 3, y + 1), label, fill=_BADGE_TEXT, font=font)
 
     return Image.alpha_composite(out, layer).convert("RGB")
 

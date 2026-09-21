@@ -631,7 +631,7 @@ class Viewer(ctk.CTk):
                 # 可点元素的清单（编号 + 文字）。图上有编号，但小字容易被网格或
                 # 相邻元素挡住，所以把清单也用文字给一份，两边对得上。
                 if elements:
-                    page = (f"{page}；【可点元素】（图上的蓝色数字就是编号，"
+                    page = (f"{page}；【可点元素】（图上的红框数字就是编号，"
                             f"点哪个就填 target=编号）：{_elements_text(elements)}"
                             if page else _elements_text(elements))
                 # 视频的真实状态（有没有在播、进度多少）——模型光看截图分不清
@@ -749,7 +749,7 @@ class Viewer(ctk.CTk):
                             label = str(el.get("t") or el.get("tag") or "")
                             desc0 = f"点击 {idx} 号「{label[:20]}」"
                         except (ValueError, TypeError, IndexError, KeyError):
-                            return (f"（编号 {tgt} 不存在——请重新看图上的蓝色数字，"
+                            return (f"（编号 {tgt} 不存在——请重新看图上的红框编号，"
                                     f"用 target 填那个编号）")
                     else:
                         cx, cy = int(action["x"]), int(action["y"])

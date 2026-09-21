@@ -611,6 +611,14 @@ class Viewer(ctk.CTk):
 
                 img = capture.get_frame()
                 extra = self._drain_inbox()
+                # 画面是不是冻住了。这个事实**必须告诉模型**：截图冻住时，
+                # 它看到的"页面没变化"不是它动作没用，而是截图早就停了——
+                # 分不清这两者它就会一直重复同一个动作（实测：同一个坐标点了 41 次，
+                # 因为抓帧停了、图一直是同一张，模型每次都得出同样的结论）。
+                stale = capture.frame_age()
+                if stale > 5.0:
+                    self._ui("err", f"画面已经 {stale:.0f} 秒没更新了"
+                                    f"（抓帧可能断了），下面这步的判断可能不准")
                 page = wc.page_info()
                 # 视频的真实状态（有没有在播、进度多少）——模型光看截图分不清
                 # "正在播"和"已暂停"，会对着正在播的视频再点一下把它点停（踩过）
@@ -623,7 +631,7 @@ class Viewer(ctk.CTk):
                 if tasks:
                     page = f"{page}；{tasks}" if page else tasks
 
-                d = brain.decide(img, goal, extra=extra, page=page)
+                d = brain.decide(img, goal, extra=extra, page=page, frame_age=stale)
                 self._ui("ai", d.thought)
                 self._ui("act", _action_text(d.action))
 

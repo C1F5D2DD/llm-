@@ -29,7 +29,7 @@ from typing import Optional, Tuple
 
 from PIL import Image
 
-__all__ = ["init", "get_frame", "has_frame", "CaptureError"]
+__all__ = ["init", "get_frame", "has_frame", "frame_age", "CaptureError"]
 
 DEFAULT_PORT = 9222
 FRAME_INTERVAL = 0.25    # 后台抓帧间隔（秒）。CDP 截图一次 40-70ms，别排太密
@@ -216,6 +216,7 @@ class _Grabber:
         self.thread: Optional[threading.Thread] = None
         self.stop = False
         self.frame = None
+        self.frame_at: Optional[float] = None   # 这一帧是什么时候抓到的
         self.error: Optional[str] = None
         self.interval = FRAME_INTERVAL
 
@@ -223,6 +224,12 @@ class _Grabber:
         self.stop = False
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+
+    def age(self) -> float:
+        """当前这帧有多旧（秒）。没帧返回 0。"""
+        if self.frame_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self.frame_at)
 
     def _run(self) -> None:
         cdp = _CDP(DEFAULT_PORT)        # 独立连接，不和主线程共用一个 websocket
@@ -244,6 +251,7 @@ class _Grabber:
 
                 sent = add_grid(img)
                 self.frame = sent                # add_grid 每次返回新图，不用 copy
+                self.frame_at = time.monotonic()  # 记下抓到的时刻，供过期判断
                 self.error = None
             except Exception as exc:
                 self.error = f"{type(exc).__name__}: {exc}"
@@ -285,11 +293,26 @@ def has_frame() -> bool:
     return _grabber is not None and _grabber.frame is not None
 
 
+# 一帧最多允许多旧（秒）。超过这个岁数还拿不到新帧，就认为抓帧已经坏了。
+# 后台线程的间隔是 0.25 秒，所以正常情况下一帧最多 0.3 秒旧；
+# 给到 5 秒是留足容错（CDP 偶发卡顿、页面在忙），又不至于让调用方
+# 用一张明显过时的图去做判断。
+FRAME_MAX_AGE = 5.0
+
+
 def get_frame():
     """拿最新一帧，返回 PIL Image。图上叠了坐标网格。
 
     帧是后台线程一直在抓的，所以这里几乎不耗时。刚 init 完还没抓到第一帧时，
     会等一小会儿（最多 2 秒）。
+
+    **拿不到新帧时抛 CaptureError，绝不返回过时的旧帧。**
+    这一点很关键，踩过一个很隐蔽的坑：原来的错误检查写在
+    `while _grabber.frame is None` 循环里面，所以只在"还没有第一帧"时生效。
+    一旦抓到过一帧，后面抓帧再失败都会静默返回那张冻结的旧图——
+    调用方毫不知情，把同一张过时画面反复喂给模型，模型就永远看到同一个页面、
+    反复做同一个动作，输出还逐字相同（实测：同一个坐标点了 41 次，
+    日志里 4 次原始返回一模一样，排查了很久才发现是图冻住了）。
     """
     if _grabber is None:
         raise CaptureError("还没连接，先调用 init(pid)")
@@ -302,4 +325,18 @@ def get_frame():
             raise CaptureError("等了 2 秒还没抓到画面，检查浏览器是不是卡住了")
         time.sleep(0.05)
 
+    # 已经有帧了，但要确认它是**新鲜的**——见上面那段说明
+    age = _grabber.age()
+    if _grabber.error and age > FRAME_MAX_AGE:
+        raise CaptureError(
+            f"抓帧已经停了 {age:.0f} 秒（最后一帧是 {age:.0f} 秒前的），"
+            f"不能再拿这张过时的图去判断页面：{_grabber.error}")
+
     return _grabber.frame
+
+
+def frame_age() -> float:
+    """当前这帧有多旧（秒）。界面可以拿它提示"画面是不是卡住了"。"""
+    if _grabber is None:
+        return 0.0
+    return _grabber.age()

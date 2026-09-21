@@ -101,6 +101,9 @@ SYSTEM_PROMPT = """你是操作浏览器页面的助手。每次你会看到一�
   另外会给一些原始数据（地址、滚动位置、标签页数）作参考，
   但**这些数据很不全**：页面内部区域的滚动、跨域 iframe 里的滚动、弹窗浮现、
   按钮变灰、视频开始播……它们统统看不出来。数据说"没变"时，**以你眼睛看到的为准**。
+- **例外：两张图完全一样时，先怀疑截图卡住了**。如果提示里写了"画面已经 N 秒没更新"
+  或者两张图逐像素相同、时间戳却隔了很久，那不是你的动作没用，是**截图停了**——
+  这时重复点击不会有任何意义，应该 ask_human 让人看一眼（或者先 reload 试试）。
 
 输出格式（**严格遵守，多余的字符都会让整个动作作废**）：
 - 只输出一个 JSON 对象，不要解释文字、不要代码块标记、不要 <think> 之类的思考标签。
@@ -338,7 +341,8 @@ def reset() -> None:
     _turn_started = None    # 时间线也重开，免得它拿旧对话的时间做判断
 
 
-def decide(img: Image.Image, goal: str, extra: str = "", page: str = "") -> Decision:
+def decide(img: Image.Image, goal: str, extra: str = "", page: str = "",
+           frame_age: float = 0.0) -> Decision:
     """看着当前画面决定下一步做什么。
 
     img    当前截图（pageCapture.get_frame() 的产物，带刻度）
@@ -349,6 +353,10 @@ def decide(img: Image.Image, goal: str, extra: str = "", page: str = "") -> Deci
            截图只能看到视口这一屏，没有这行模型就不知道下面还有东西，
            会对着"屏幕上看得见但其实不是目标"的元素反复点（实测死循环）。
            **这些只是参考数据，变没变由模型对比两屏自己判断。**
+    frame_age  这张图有多旧（秒，来自 pageCapture.frame_age()）。超过阈值会
+           明确告诉模型"画面卡住了"——否则它会把"两张图一样"理解成
+           "我的动作没用"，然后一直重复（实测：同一个坐标点了 41 次，
+           根因是抓帧停了、图冻住了）。
 
     为了让模型能判断上一步有没有生效，这里会把**上一次的截图一起发过去**，
     模型自己对比"上一屏 vs 当前屏"。程序不替它下"页面有没有变化"的结论——
@@ -370,7 +378,8 @@ def decide(img: Image.Image, goal: str, extra: str = "", page: str = "") -> Deci
 
     _ensure_log()
     data_uri = _to_data_uri(img)
-    text = _build_prompt(goal, extra, page, has_prev=_last_frame is not None)
+    text = _build_prompt(goal, extra, page, has_prev=_last_frame is not None,
+                         frame_age=frame_age)
     _log.debug("请求：goal=%r extra=%r page=%r 图=%s 上一屏=%s 历史=%d 条",
                goal, extra, page, img.size, "有" if _last_frame else "无", len(_history))
 
@@ -496,7 +505,8 @@ def _time_brief() -> str:
     return "；".join(parts)
 
 
-def _build_prompt(goal: str, extra: str, page: str = "", has_prev: bool = False) -> str:
+def _build_prompt(goal: str, extra: str, page: str = "", has_prev: bool = False,
+                  frame_age: float = 0.0) -> str:
     parts = [f"目标：{goal}"]
     if extra:
         # 带上你说这话的时刻：模型据此判断"这是刚说的、还是十分钟前说的"，
@@ -505,6 +515,11 @@ def _build_prompt(goal: str, extra: str, page: str = "", has_prev: bool = False)
     # 时间放在页面状况前面：模型做"还要等多久""是不是卡太久了"这类判断时
     # 靠的就是它，别埋在长串页面数据后面
     parts.append(_time_brief())
+    # 截图冻住时得明说，否则模型会把"图没变"当成"我的动作没用"，一直重复
+    if frame_age > 5.0:
+        parts.append(f"⚠ 画面已经 {frame_age:.0f} 秒没有更新了，"
+                     f"截图可能卡住——这种情况下「两张图一样」"
+                     f"不代表你的动作没用")
     if page:
         parts.append(f"页面状况（参考数据，不全，别只看它）：{page}")
     if has_prev:

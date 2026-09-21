@@ -391,10 +391,21 @@ def decide(img: Image.Image, goal: str, extra: str = "", page: str = "") -> Deci
     reply = _chat(messages)
     decision = _parse(reply)
 
-    # 记进历史：只留文本，不带图，省钱（图靠上面 _last_frame 单独传一张）
-    # 每条前面加 [时:分:秒]——模型看不到时钟，不给它时间戳，它就不知道
-    # 上一步是多久以前的，也就没法判断"是不是卡太久了"。
-    _history.append({"role": "user", "content": f"[{_hhmmss(now)}] {text}"})
+    # 记进历史。两条注意：
+    #
+    # 1. **不要存 page**。page 是"当下这一屏"的事实（视口、滚动位置、视频状态、
+    #    任务点清单…），历史里那份早就过时了，没有任何参考价值——但它很长
+    #    （实测一条 400+ 字，光"还没完成 82 项：1.1 …、1.2 …"就能占几百 token）。
+    #    存进去的话，8 步历史就是 8 份重复的静态数据，把真正要紧的东西
+    #    （上一步干了什么、结果如何）淹在噪音里。实测模型因此发现不了自己在
+    #    重复同一个动作，同一个坐标点了 41 次（输入 token 飙到 8212，大半是它）。
+    #
+    # 2. 每条前面加 [时:分:秒]：模型看不到时钟，不给时间戳它就不知道上一步是
+    #    多久以前的，也就没法判断"是不是卡太久了"。
+    hist = f"[{_hhmmss(now)}] 目标：{goal}"
+    if extra:
+        hist += f"\n人工指令：{extra}"
+    _history.append({"role": "user", "content": hist})
     _history.append({"role": "assistant",
                      "content": f"[{_hhmmss(now)}] " + json.dumps(
                          {"thought": decision.thought, "action": decision.action},

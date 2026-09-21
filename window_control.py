@@ -788,6 +788,80 @@ def tasks_info() -> str:
     return "；".join(parts)
 
 
+def elements_near(x: int, y: int, radius: int = 90, limit: int = 12) -> str:
+    """报出 (x,y) 附近有哪些可点的元素，各自中心在哪。读不到返回空串。
+
+    **为什么需要它**：让 VLM 靠数网格线精确读出一个小元素的中心，精度并不够
+    ——实测点「章节测验」标签（中心 214）读成 280，偏 66px 点到了隔壁，
+    它还以为"页面没反应"，接着换了三个 x 又全在同一行上打转。
+    提示词怎么写都治不了这个（模型看图估算的精度天生有限）。
+
+    所以点偏了的时候，由程序把**候选元素的精确中心**直接给它：
+    从浏览器里查真实 DOM，坐标是准的，模型只要挑一个即可。
+    只在点到没效果时才调用，平时不打扰（页面上小元素有几十个，全报是噪音）。
+    """
+    try:
+        raw = _require().eval(_NEAR_JS % (int(x), int(y), int(radius), int(limit)))
+        items = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return ""
+    if not isinstance(items, list) or not items:
+        return ""
+
+    desc = []
+    for it in items[:limit]:
+        try:
+            t = str(it.get("t", "")).strip().replace("\n", " ")
+            if not t:
+                continue
+            cx, cy = int(it.get("x")), int(it.get("y"))
+            w, h = int(it.get("w") or 0), int(it.get("h") or 0)
+            desc.append(f"「{t[:16]}」中心 ({cx}, {cy})，{w}x{h}px")
+        except (TypeError, ValueError):
+            continue
+    if not desc:
+        return ""
+    return (f"（程序查了一下：({x},{y}) 附近有这些可点的元素，"
+            f"坐标是从页面里直接读的、准确，要哪个就点哪个："
+            + "；".join(desc) + "）")
+
+
+# (x, y, radius, limit) 四个位置参数
+_NEAR_JS = """(() => {
+  const CX = %d, CY = %d, R = %d, LIMIT = %d;
+  const sel = 'a,button,input,select,label,[role=button],[onclick],li,span,i,em,b,strong';
+  const out = [], seen = new Set();
+  function walk(doc, depth) {
+    if (!doc || depth > 4) return;
+    for (const el of doc.querySelectorAll(sel)) {
+      try {
+        const r = el.getBoundingClientRect();
+        if (r.width < 8 || r.height < 8) continue;
+        if (r.width > 400 || r.height > 200) continue;
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        if (Math.hypot(cx - CX, cy - CY) > R) continue;      // 只要附近的
+        const t = (el.innerText || el.value
+                   || el.getAttribute('aria-label') || '').trim();
+        if (!t || t.length > 24) continue;
+        const k = t + Math.round(cx) + Math.round(cy);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push({t: t.replace(/\\s+/g, ' '),
+                  x: Math.round(cx), y: Math.round(cy),
+                  w: Math.round(r.width), h: Math.round(r.height),
+                  d: Math.round(Math.hypot(cx - CX, cy - CY))});
+      } catch (e) {}
+    }
+    for (const f of doc.querySelectorAll('iframe')) {
+      try { if (f.contentDocument) walk(f.contentDocument, depth + 1); } catch (e) {}
+    }
+  }
+  walk(document, 0);
+  out.sort((a, b) => a.d - b.d);        // 离点击位置最近的排前面
+  return JSON.stringify(out.slice(0, LIMIT));
+})()"""
+
+
 def page_info() -> str:
     """页面有多大、滚到哪了，拼成一句话塞给模型。
 

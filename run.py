@@ -716,9 +716,12 @@ class Viewer(ctk.CTk):
         try:
             if t in ("click", "scroll", "drag", "type", "press"):
                 before = wc.page_state()
+                clicked_at = None
                 if t == "click":
-                    wc.click(int(action["x"]), int(action["y"]), settle=0.6)
-                    desc = f"已点击 ({int(action['x'])}, {int(action['y'])})"
+                    cx, cy = int(action["x"]), int(action["y"])
+                    wc.click(cx, cy, settle=0.6)
+                    desc = f"已点击 ({cx}, {cy})"
+                    clicked_at = (cx, cy)
                 elif t == "scroll":
                     n = int(action.get("notches", 3))
                     # 页面里各块区域各滚各的（学习通左边视频区、右边目录栏就是），
@@ -743,7 +746,16 @@ class Viewer(ctk.CTk):
                     key = str(action.get("key", "Enter"))
                     wc.press_key(key)
                     desc = f"已按键 {key}"
-                return desc + self._facts(before)
+                out = desc + self._facts(before)
+                # 点了但页面没变 -> 很可能是坐标读偏了（模型靠看图估小元素的中心，
+                # 精度不够）。这时由程序把附近可点元素的**精确坐标**直接报给它，
+                # 让它挑一个，而不是继续瞎猜——实测点「章节测验」标签读成 280，
+                # 实际中心 214，偏 66px 点到隔壁，它还以为"页面没反应"。
+                if clicked_at and "没有" in out:
+                    near = wc.elements_near(*clicked_at)
+                    if near:
+                        out += "\n" + near
+                return out
 
             if t == "wait":
                 return self._wait(float(action.get("seconds", 3)))

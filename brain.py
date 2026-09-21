@@ -74,7 +74,7 @@ def _ensure_log() -> None:
 
 _ensure_log()      # 模块加载就挂上，这样 save_config 这些接口也都有日志
 
-MAX_HISTORY = 12        # 上下文里保留最近多少步（文本形式，不带历史图）
+MAX_HISTORY =12       # 上下文里保留最近多少步（文本形式，不带历史图）
 
 # 下面这段提示词里写了"单次等待上限 600 秒""一个回合 50 步"——
 # 这两个数字来自 run.py 的 `_wait`（MAX_WAIT）和 `MAX_STEPS`。
@@ -281,11 +281,19 @@ def load_config() -> Optional[Dict[str, str]]:
 
 
 def init(base_url: str, api_key: str, model: str,
-         temperature: float = 0.0, max_tokens: int = 800,
+         temperature: float = 0.15, max_tokens: int = 800,
          timeout: float = 90.0, json_mode: bool = True) -> None:
     """配置模型并接管。失败抛 BrainError。
 
     base_url/api_key/model   OpenAI 兼容网关的三项配置
+    temperature             默认 0.15。**别用 0**：温度为 0 时模型几乎完全
+                            确定性，一旦判断失误（比如把"图没变"理解成
+                            "再试一次"），之后每步输入只要差不多，输出就
+                            逐字相同，会一直卡在同一个动作里出不来
+                            （实测踩过：同一个坐标点了 41 次）。
+                            给一点随机性，它才有机会自己换个思路；
+                            但也不能太高——这个任务要精确读网格坐标，
+                            温度高了坐标会飘、JSON 也容易写坏。
     json_mode                True 时要求网关返回 JSON 对象；某些网关不支持，
                              报错了就传 False（这时靠提示词约束 + 容错解析）
 
@@ -536,7 +544,7 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
     kwargs: Dict[str, Any] = {
         "model": _model,
         "messages": messages,
-        "temperature": _options.get("temperature", 0.0),
+        "temperature": _options.get("temperature", 0.15),
         "max_tokens": _options.get("max_tokens", 800),
     }
     if _options.get("json_mode", True):

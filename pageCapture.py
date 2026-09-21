@@ -35,10 +35,19 @@ DEFAULT_PORT = 9222
 FRAME_INTERVAL = 0.25    # 后台抓帧间隔（秒）。CDP 截图一次 40-70ms，别排太密
 
 # 网格样式
-_LINE = (255, 80, 80, 70)          # 普通网格线（半透明红）
-_LINE_MAJOR = (255, 80, 80, 150)   # 每 5 格一条重线，方便估位
+_LINE = (255, 80, 80, 42)          # 细线（20px）：很淡，只用来数格子
+_LINE_MAJOR = (255, 80, 80, 130)   # 主格线（100px）：深一点，好定位
 _LABEL_BG = (220, 30, 30, 210)
 _LABEL_FG = (255, 255, 255, 255)
+
+# 网格疏密。**这两个数字是踩坑定下来的**：
+# 早先按视口宽度算间距（1359px 的窗口会选 200px），模型得在 200x200 的大格子里
+# 靠肉眼估位置，实测反复算错坐标——点 (200,537) 点了五六次都没中，
+# 它还以为是自己点得不够准、或者页面没反应。
+# 现在细线固定 20px：模型不用估，数格子就行（最多数 5 格到下一个数字）。
+# 数字保持 100px 一个：每 20px 都标数字的话，三位数会糊成一片、把页面内容全挡住。
+GRID_STEP = 20         # 细网格间距（像素）
+LABEL_STEP = 100       # 每多少像素标一个数字
 
 _font_cache: dict = {}
 _grid_cache: dict = {}      # 网格层缓存：页面尺寸不变就不用重画
@@ -67,17 +76,12 @@ def _font(size: int = 12):
     return f
 
 
-def _step(size: int, want: int = 10) -> int:
-    """挑一个整齐的网格间距，让画面里大约有 want 条线。"""
-    raw = max(1, size // max(1, want))
-    for s in (50, 100, 200, 250, 500, 1000):
-        if s >= raw:
-            return s
-    return 1000
-
-
 def _grid_layer(size: Tuple[int, int]):
-    """生成网格层（带缓存）。返回的是缓存对象，调用方别改它。"""
+    """生成网格层（带缓存）。返回的是缓存对象，调用方别改它。
+
+    两层线：20px 的细线（数格子用）+ 100px 的主格线（上面标数字）。
+    模型只要从最近的数字往两边数几格，就能读出精确坐标，不用估。
+    """
     from PIL import Image, ImageDraw
 
     w, h = size
@@ -87,22 +91,28 @@ def _grid_layer(size: Tuple[int, int]):
     layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
     font = _font(12)
-    step = _step(w)
 
-    for x in range(step, w, step):
-        major = (x // step) % 5 == 0
-        draw.line([(x, 0), (x, h)], fill=_LINE_MAJOR if major else _LINE, width=1)
-    for y in range(step, h, step):
-        major = (y // step) % 5 == 0
-        draw.line([(0, y), (w, y)], fill=_LINE_MAJOR if major else _LINE, width=1)
+    # 细线：跳过会被主格线覆盖的位置
+    for x in range(GRID_STEP, w, GRID_STEP):
+        if x % LABEL_STEP:
+            draw.line([(x, 0), (x, h)], fill=_LINE, width=1)
+    for y in range(GRID_STEP, h, GRID_STEP):
+        if y % LABEL_STEP:
+            draw.line([(0, y), (w, y)], fill=_LINE, width=1)
+
+    # 主格线
+    for x in range(LABEL_STEP, w, LABEL_STEP):
+        draw.line([(x, 0), (x, h)], fill=_LINE_MAJOR, width=1)
+    for y in range(LABEL_STEP, h, LABEL_STEP):
+        draw.line([(0, y), (w, y)], fill=_LINE_MAJOR, width=1)
 
     # 数字标在线的上端/左端，标的就是这条线的页面坐标
-    for x in range(step, w, step):
+    for x in range(LABEL_STEP, w, LABEL_STEP):
         s = str(x)
         tw = draw.textlength(s, font=font)
         draw.rectangle([x + 1, 1, x + tw + 5, 17], fill=_LABEL_BG)
         draw.text((x + 3, 2), s, fill=_LABEL_FG, font=font)
-    for y in range(step, h, step):
+    for y in range(LABEL_STEP, h, LABEL_STEP):
         s = str(y)
         tw = draw.textlength(s, font=font)
         draw.rectangle([1, y + 1, tw + 5, y + 17], fill=_LABEL_BG)

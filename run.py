@@ -990,6 +990,13 @@ def _action_sig(action: Dict[str, Any]) -> str:
     """
     t = str(action.get("type", "?"))
     if t in ("click", "scroll", "drag"):
+        # 用编号点的（target=7）必须按编号区分！早先这里只看 x/y，
+        # 而编号点击根本没有 x/y，于是所有编号点击的签名都是 "click:"，
+        # 点 33 号、16 号、26 号、21 号全被算成同一个动作，十几个不同的点击
+        # 就触发了"这个动作做了 15 次"的误报（实测踩过）。
+        tgt = action.get("target")
+        if tgt is not None:
+            return f"{t}:target={tgt}"
         nums = []
         for k in ("x", "y", "x1", "y1", "x2", "y2"):
             v = action.get(k)

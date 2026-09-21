@@ -29,7 +29,8 @@ from typing import Optional, Tuple
 
 from PIL import Image
 
-__all__ = ["init", "get_frame", "has_frame", "frame_age", "CaptureError"]
+__all__ = ["init", "get_frame", "snapshot", "has_frame", "frame_age",
+           "add_grid", "annotate", "CaptureError"]
 
 DEFAULT_PORT = 9222
 FRAME_INTERVAL = 0.25    # 后台抓帧间隔（秒）。CDP 截图一次 40-70ms，别排太密
@@ -132,6 +133,149 @@ def add_grid(img):
     return Image.alpha_composite(base, _grid_layer(base.size)).convert("RGB")
 
 
+# ---------------------------------------------------------------- 可点元素编号
+#
+# 为什么要有这个：让多模态模型看着截图数网格线、估出一个小元素的中心，
+# **精度根本不够**。实测点「章节测验」标签（真实中心 214）读成 280，偏 66px
+# 点到隔壁去了，它还以为是"页面没反应"，接着换了三个 x 又全落在同一行上打转。
+# 提示词从"照网格读数"一路改到"量左右边界取中点"，都治不了——这是模型看图
+# 估算的精度上限，不是它不认真。
+#
+# 改成：程序把页面上所有可点的东西**枚举出来、编号、画在图上**，
+# 模型只要回一个编号，坐标由代码去 DOM 里查（准的）。
+# 模型擅长"这是什么、该点哪个"这类判断，不擅长毫米级的空间定位——
+# 那就别让它做后者的活。
+
+# 收集可点元素的脚本。**要注意三件事**：
+#
+# 1. 坐标要加上 iframe 的偏移。学习通的播放器、目录都在 iframe 里，
+#    iframe 内部的 getBoundingClientRect 是相对它自己视口的，不加偏移就整体错位。
+# 2. **嵌套元素要去重**。一个「目录」标签往往被 li > div > span 三层都命中，
+#    三层都 clickable，清单里就会冒出三个几乎一样的项，模型选编号时看花眼。
+# 3. 只要**完全在视口内**的元素——滚动之后顶部那些 y 为负的还在 DOM 里，
+#    编上号会让模型点到一个看不见的地方。
+_ELEMENTS_JS = """(() => {
+  const VW = window.innerWidth, VH = window.innerHeight;
+  const cand = [];
+  const TAGS = ['A','BUTTON','INPUT','SELECT','TEXTAREA','LABEL','SUMMARY'];
+
+  function textOf(el) {
+    let t = (el.innerText || el.value || el.getAttribute('aria-label')
+             || el.getAttribute('title') || el.getAttribute('placeholder') || '');
+    return String(t).replace(/\\s+/g, ' ').trim().slice(0, 30);
+  }
+
+  function clickable(el) {
+    try {
+      if (TAGS.indexOf(el.tagName) >= 0) return true;
+      if (el.getAttribute('onclick')) return true;
+      const role = el.getAttribute('role');
+      if (role === 'button' || role === 'link' || role === 'tab' || role === 'checkbox') return true;
+      return window.getComputedStyle(el).cursor === 'pointer';
+    } catch (e) { return false; }
+  }
+
+  function collect(doc, ox, oy, depth) {
+    if (!doc || depth > 3) return;
+    let list;
+    try { list = doc.querySelectorAll('*'); } catch (e) { return; }
+    for (let i = 0; i < list.length; i++) {
+      const el = list[i];
+      try {
+        const r = el.getBoundingClientRect();
+        // 太小点不准、太大的是整块容器（不是"一个目标"）
+        if (r.width < 10 || r.height < 10) continue;
+        if (r.width > 900 || r.height > 620) continue;
+        if (!clickable(el)) continue;
+        const cs = window.getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+        if (parseFloat(cs.opacity || '1') < 0.15) continue;
+        const L = r.left + ox, T = r.top + oy, R = r.right + ox, B = r.bottom + oy;
+        // 完全在视口内才编号：露出一半的，点它有一半概率点空
+        if (L < -2 || T < -2 || R > VW + 2 || B > VH + 2) continue;
+        cand.push({t: textOf(el), tag: el.tagName,
+                   l: L, ty: T, w: r.width, h: r.height});
+      } catch (e) {}
+    }
+    let frames;
+    try { frames = doc.querySelectorAll('iframe'); } catch (e) { return; }
+    for (let i = 0; i < frames.length; i++) {
+      try {
+        const f = frames[i], ir = f.getBoundingClientRect();
+        if (f.contentDocument) collect(f.contentDocument, ox + ir.left, oy + ir.top, depth + 1);
+      } catch (e) {}
+    }
+  }
+
+  collect(document, 0, 0, 0);
+
+  // 去重：位置范围重合、互相包含的，只留"最具体"的那个。
+  // 判据是文字更短更专指（li 的文字通常是 "1.2 xxx yyy"，里面 span 才是 "1.2"），
+  // 都没文字就留面积小的。
+  const keep = [];
+  for (const c of cand) {
+    let hit = -1;
+    for (let j = 0; j < keep.length; j++) {
+      const k = keep[j];
+      const near = Math.abs(k.l - c.l) < 8 && Math.abs(k.ty - c.ty) < 8
+                && Math.abs(k.w - c.w) < 16 && Math.abs(k.h - c.h) < 16;
+      const inside = c.l >= k.l - 8 && c.ty >= k.ty - 8
+                  && c.l + c.w <= k.l + k.w + 16 && c.ty + c.h <= k.ty + k.h + 16;
+      if (near || inside) { hit = j; break; }
+    }
+    if (hit < 0) { keep.push(c); continue; }
+    const k = keep[hit];
+    const better = c.t && (!k.t || c.t.length < k.t.length);
+    const bothEmpty = !k.t && !c.t && c.w * c.h < k.w * k.h;
+    if (better || bothEmpty) keep[hit] = c;
+  }
+
+  keep.sort((a, b) => (a.ty - b.ty) || (a.l - b.l));
+  const out = keep.slice(0, 90).map(c => ({
+    t: c.t, tag: c.tag,
+    x: Math.round(c.l + c.w / 2), y: Math.round(c.ty + c.h / 2),
+    l: Math.round(c.l), ty: Math.round(c.ty),
+    w: Math.round(c.w), h: Math.round(c.h),
+  }));
+  return JSON.stringify(out);
+})()"""
+
+# 编号样式
+_BADGE_BG = (20, 110, 220, 235)      # 蓝底，和红色网格区分开
+_BADGE_FG = (255, 255, 255, 255)
+
+
+def _draw_badges(img, elements):
+    """把编号画在图上，返回新图。
+
+    编号框贴在元素的左上角——放中心会挡住元素本身，模型就看不清它是什么了。
+    """
+    if not elements:
+        return img
+    from PIL import ImageDraw
+
+    out = img.convert("RGBA")
+    layer = Image.new("RGBA", out.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    font = _font(12)
+
+    for i, el in enumerate(elements, start=1):
+        label = str(i)
+        tw = draw.textlength(label, font=font)
+        bw, bh = tw + 8, 16
+        x = max(0, min(out.size[0] - bw, int(el.get("l", 0))))
+        y = max(0, min(out.size[1] - bh, int(el.get("ty", 0))))
+        draw.rectangle([x, y, x + bw, y + bh], fill=_BADGE_BG)
+        draw.text((x + 4, y + 2), label, fill=_BADGE_FG, font=font)
+
+    return Image.alpha_composite(out, layer).convert("RGB")
+
+
+def annotate(img, elements):
+    """给图叠上"网格 + 元素编号"。"""
+    return _draw_badges(add_grid(img), elements)
+
+
 # ---------------------------------------------------------------- CDP
 
 class _CDP:
@@ -227,6 +371,7 @@ class _Grabber:
         self.stop = False
         self.frame = None
         self.frame_at: Optional[float] = None   # 这一帧是什么时候抓到的
+        self.elements: list = []                # 这一帧上各编号对应的元素
         self.error: Optional[str] = None
         self.interval = FRAME_INTERVAL
 
@@ -246,8 +391,16 @@ class _Grabber:
         while not self.stop:
             t0 = time.monotonic()
             try:
-                # 截整个视口。窗口尺寸由调用方用 window_control.resize 定好，
-                # 网站会按那个尺寸自动排版，所以截下来就是"小窗口里的完整页面"。
+                # 1) 先枚举可点元素（编号要画在图上，得先知道有哪些）
+                try:
+                    raw = cdp.eval(_ELEMENTS_JS)
+                    elements = json.loads(raw) if isinstance(raw, str) else (raw or [])
+                    if not isinstance(elements, list):
+                        elements = []
+                except Exception:
+                    elements = []       # 枚举失败不致命，这一帧就没有编号
+
+                # 2) 截整个视口
                 r = cdp.call("Page.captureScreenshot",
                              {"format": "jpeg", "quality": 85})
                 img = Image.open(io.BytesIO(base64.b64decode(r["data"]))).convert("RGB")
@@ -259,9 +412,11 @@ class _Grabber:
                 if vw and vh and img.size != (vw, vh):
                     img = img.resize((vw, vh), Image.BILINEAR)
 
-                sent = add_grid(img)
-                self.frame = sent                # add_grid 每次返回新图，不用 copy
-                self.frame_at = time.monotonic()  # 记下抓到的时刻，供过期判断
+                # 3) 叠网格 + 编号。元素清单和这一帧是配套的，一起存。
+                sent = annotate(img, elements)
+                self.frame = sent
+                self.elements = elements
+                self.frame_at = time.monotonic()
                 self.error = None
             except Exception as exc:
                 self.error = f"{type(exc).__name__}: {exc}"
@@ -350,3 +505,21 @@ def frame_age() -> float:
     if _grabber is None:
         return 0.0
     return _grabber.age()
+
+
+def snapshot():
+    """一次拿到**配套的**（图, 元素清单）。
+
+    图和编号必须来自同一帧：图上是第 7 号，清单里的第 7 项也得是同一个元素，
+    否则模型说"点 7 号"就会点到别处。所以别分别调 get_frame() 和 elements()，
+    用这个原子接口——后台线程每 0.25 秒就换一帧，分两次取中间可能被换掉。
+
+    返回 (PIL.Image, list)。元素是 dict，含 t(文字)/x/y(中心)/w/h/l/ty。
+    返回的清单是**副本**，调用方随便用。
+    """
+    img = get_frame()          # 顺带做了过期检查，拿不到会抛
+    if _grabber is None:
+        return img, []
+    elems = _grabber.elements or []
+    # 深拷贝一层：里面的 dict 会被调用方读，别和后台线程共享同一个对象
+    return img, [dict(e) for e in elems if isinstance(e, dict)]

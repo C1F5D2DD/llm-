@@ -182,6 +182,9 @@ class Viewer(ctk.CTk):
         # 每个动作做了多少次（签名 -> 次数）。超 REPEAT_LIMIT 就掐掉整个回合，
         # 见文件顶部那段说明。每个回合开始时清零。
         self._repeat: Dict[str, int] = {}
+        # 当前这帧的可点元素清单（capture.snapshot 给的），_exec 用它把
+        # 模型选的编号换成真实坐标
+        self._elements: list = []
         # 「插话打断等待」用：发消息时置上，让 _wait 立刻收工去处理你说的话。
         # 和 _stop_evt（结束整个回合）分开——插话只是想跳过剩余等待，不是要停。
         self._interrupt = threading.Event()
@@ -615,11 +618,22 @@ class Viewer(ctk.CTk):
                 # 它看到的"页面没变化"不是它动作没用，而是截图早就停了——
                 # 分不清这两者它就会一直重复同一个动作（实测：同一个坐标点了 41 次，
                 # 因为抓帧停了、图一直是同一张，模型每次都得出同样的结论）。
+                # 一次拿到配套的「图 + 元素清单」：图上的编号和清单里的下标必须
+                # 是同一帧的，否则模型说"点 7 号"会点到别处（踩过：分两次取，
+                # 中间后台线程换了帧）
+                img, elements = capture.snapshot()
+                self._elements = elements      # _exec 要用它把编号换成坐标
                 stale = capture.frame_age()
                 if stale > 5.0:
                     self._ui("err", f"画面已经 {stale:.0f} 秒没更新了"
                                     f"（抓帧可能断了），下面这步的判断可能不准")
                 page = wc.page_info()
+                # 可点元素的清单（编号 + 文字）。图上有编号，但小字容易被网格或
+                # 相邻元素挡住，所以把清单也用文字给一份，两边对得上。
+                if elements:
+                    page = (f"{page}；【可点元素】（图上的蓝色数字就是编号，"
+                            f"点哪个就填 target=编号）：{_elements_text(elements)}"
+                            if page else _elements_text(elements))
                 # 视频的真实状态（有没有在播、进度多少）——模型光看截图分不清
                 # "正在播"和"已暂停"，会对着正在播的视频再点一下把它点停（踩过）
                 video = wc.video_info()
@@ -718,9 +732,30 @@ class Viewer(ctk.CTk):
                 before = wc.page_state()
                 clicked_at = None
                 if t == "click":
-                    cx, cy = int(action["x"]), int(action["y"])
+                    # 优先用编号：模型选编号，坐标由代码从元素清单里查（准的）。
+                    # 让它自己读坐标是行不通的——实测点「章节测验」标签，
+                    # 真实中心 214，它读成 280，偏 66px 点到隔壁去了。
+                    tgt = action.get("target")
+                    if tgt is not None:
+                        try:
+                            idx = int(tgt)
+                            # 编号从 1 开始。这里必须显式挡住 <=0：
+                            # Python 的负索引不会报错，target=0 会悄悄点到
+                            # 列表最后一个元素上（实测踩过）
+                            if idx < 1:
+                                raise ValueError("编号必须从 1 开始")
+                            el = self._elements[idx - 1]
+                            cx, cy = int(el["x"]), int(el["y"])
+                            label = str(el.get("t") or el.get("tag") or "")
+                            desc0 = f"点击 {idx} 号「{label[:20]}」"
+                        except (ValueError, TypeError, IndexError, KeyError):
+                            return (f"（编号 {tgt} 不存在——请重新看图上的蓝色数字，"
+                                    f"用 target 填那个编号）")
+                    else:
+                        cx, cy = int(action["x"]), int(action["y"])
+                        desc0 = f"已点击 ({cx}, {cy})"
                     wc.click(cx, cy, settle=0.6)
-                    desc = f"已点击 ({cx}, {cy})"
+                    desc = desc0
                     clicked_at = (cx, cy)
                 elif t == "scroll":
                     n = int(action.get("notches", 3))
@@ -926,6 +961,22 @@ def _repeat_limits(action_type: str) -> "tuple[int, int]":
     return REPEAT_WARN, REPEAT_STOP
 
 
+def _elements_text(elements, limit: int = 60) -> str:
+    """把可点元素列成「编号 文字」给模型看。
+
+    图上已经画了编号，但小字容易被网格线或相邻元素挡住——文字版更保险，
+    两边对得上，模型选编号时就不会数错。
+    """
+    parts = []
+    for i, el in enumerate(elements[:limit], start=1):
+        t = str(el.get("t") or "").strip().replace("\n", " ")
+        tag = str(el.get("tag") or "")
+        w, h = int(el.get("w") or 0), int(el.get("h") or 0)
+        label = f"{t[:18]}" if t else f"<{tag}>"
+        parts.append(f"{i}={label}({w}x{h})")
+    return "，".join(parts)
+
+
 def _action_sig(action: Dict[str, Any]) -> str:
     """给动作算一个"是不是同一件事"的签名，用来数重复次数。
 
@@ -963,6 +1014,8 @@ def _action_text(action: Dict[str, Any]) -> str:
     """把一个动作翻成人能看懂的一句话，显示在对话区里。"""
     t = action.get("type")
     if t == "click":
+        if action.get("target") is not None:
+            return f"点击 {action.get('target')} 号元素"
         return f"点击 ({action.get('x')}, {action.get('y')})"
     if t == "scroll":
         n = int(action.get("notches", 3))

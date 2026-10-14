@@ -28,7 +28,7 @@ from typing import Optional
 
 __all__ = ["init", "find_hwnd", "click", "drag", "scroll",
            "type_text", "press_key", "reload_page",
-           "page_state", "page_info", "video_info", "tasks_info",
+           "page_state", "page_info", "video_info",
            "move_out", "move_in", "resize", "WindowError"]
 
 DEFAULT_PORT = 9222     # Edge 的调试端口，和 run.py 里启动时用的一致
@@ -198,27 +198,6 @@ _SCROLL_JS = """(() => {
                          ok: Math.abs(window.scrollY - before) >= 1});
 })()"""
 
-
-# 学习通把"任务点已完成"写在 DOM 里（目录项里带 icon_Completed 这个类）。
-# 这件事**必须程序来读**：截图里那个绿勾只是个很小的图标，模型要逐条认它、
-# 还得跟左侧内容对上，很容易看漏，于是就反复去做已经做完的任务点
-# （实测踩过：用户连说两次"别重复完成已经完成的任务点"）。
-_TASKS_JS = """(() => {
-  const done = [], todo = [];
-  for (const el of document.querySelectorAll('div')) {
-    const cls = String(el.className || '');
-    if (cls.indexOf('posCatalog_select') < 0) continue;
-    // firstLayer 是章节标题（"1 课程引入"这种分组），不是任务点——别把它们
-    // 当成"未完成的任务点"报给模型，否则它会去点标题。
-    if (cls.indexOf('firstLayer') >= 0) continue;
-    const txt = (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
-    if (txt.length < 3) continue;
-    const icon = el.querySelector('[class*="icon_"]');
-    const completed = !!icon && String(icon.className).indexOf('Completed') >= 0;
-    (completed ? done : todo).push(txt);
-  }
-  return JSON.stringify({done: done, todo: todo});
-})()"""
 
 
 class WindowError(RuntimeError):
@@ -752,117 +731,7 @@ def video_info() -> str:
         return ""
 
 
-def tasks_info() -> str:
-    """课程目录里哪些任务点已经完成、哪些还没做。读不到就返回空串。
-
-    **这是程序替模型"看准"的第二件事**（第一件是视频状态）：目录里那个绿勾
-    在截图里只是个小图标，模型逐条认容易看漏，于是就反复点已经做完的任务点。
-    学习通把状态写在 `icon_Completed` 这个类上，读它比看图可靠得多。
-
-    返回形如「已完成 41 项（1.1 课程简介、1.2 …）；未完成 3 项（3.1 …）」。
-    """
-    try:
-        raw = _require().eval(_TASKS_JS)
-        d = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception:
-        return ""
-    if not isinstance(d, dict):
-        return ""
-    done = d.get("done") if isinstance(d.get("done"), list) else []
-    todo = d.get("todo") if isinstance(d.get("todo"), list) else []
-    if not done and not todo:
-        return ""
-
-    def brief(items) -> str:
-        head = "、".join(str(x) for x in items[:6])
-        more = f" 等 {len(items)} 项" if len(items) > 6 else ""
-        return head + more
-
-    parts = []
-    if todo:
-        parts.append(f"**还没完成 {len(todo)} 项**：{brief(todo)}")
-    else:
-        parts.append("目录里已经没有未完成的项了")
-    if done:
-        parts.append(f"已经完成 {len(done)} 项（{brief(done)}）——**别再去点它们**")
-    return "；".join(parts)
-
-
-def elements_near(x: int, y: int, radius: int = 90, limit: int = 12) -> str:
-    """报出 (x,y) 附近有哪些可点的元素，各自中心在哪。读不到返回空串。
-
-    **为什么需要它**：让 VLM 靠数网格线精确读出一个小元素的中心，精度并不够
-    ——实测点「章节测验」标签（中心 214）读成 280，偏 66px 点到了隔壁，
-    它还以为"页面没反应"，接着换了三个 x 又全在同一行上打转。
-    提示词怎么写都治不了这个（模型看图估算的精度天生有限）。
-
-    所以点偏了的时候，由程序把**候选元素的精确中心**直接给它：
-    从浏览器里查真实 DOM，坐标是准的，模型只要挑一个即可。
-    只在点到没效果时才调用，平时不打扰（页面上小元素有几十个，全报是噪音）。
-    """
-    try:
-        raw = _require().eval(_NEAR_JS % (int(x), int(y), int(radius), int(limit)))
-        items = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception:
-        return ""
-    if not isinstance(items, list) or not items:
-        return ""
-
-    desc = []
-    for it in items[:limit]:
-        try:
-            t = str(it.get("t", "")).strip().replace("\n", " ")
-            if not t:
-                continue
-            cx, cy = int(it.get("x")), int(it.get("y"))
-            w, h = int(it.get("w") or 0), int(it.get("h") or 0)
-            desc.append(f"「{t[:16]}」中心 ({cx}, {cy})，{w}x{h}px")
-        except (TypeError, ValueError):
-            continue
-    if not desc:
-        return ""
-    return (f"（程序查了一下：({x},{y}) 附近有这些可点的元素，"
-            f"坐标是从页面里直接读的、准确，要哪个就点哪个："
-            + "；".join(desc) + "）")
-
-
-# (x, y, radius, limit) 四个位置参数
-_NEAR_JS = """(() => {
-  const CX = %d, CY = %d, R = %d, LIMIT = %d;
-  const sel = 'a,button,input,select,label,[role=button],[onclick],li,span,i,em,b,strong';
-  const out = [], seen = new Set();
-  function walk(doc, depth) {
-    if (!doc || depth > 4) return;
-    for (const el of doc.querySelectorAll(sel)) {
-      try {
-        const r = el.getBoundingClientRect();
-        if (r.width < 8 || r.height < 8) continue;
-        if (r.width > 400 || r.height > 200) continue;
-        const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-        if (Math.hypot(cx - CX, cy - CY) > R) continue;      // 只要附近的
-        const t = (el.innerText || el.value
-                   || el.getAttribute('aria-label') || '').trim();
-        if (!t || t.length > 24) continue;
-        const k = t + Math.round(cx) + Math.round(cy);
-        if (seen.has(k)) continue;
-        seen.add(k);
-        out.push({t: t.replace(/\\s+/g, ' '),
-                  x: Math.round(cx), y: Math.round(cy),
-                  w: Math.round(r.width), h: Math.round(r.height),
-                  d: Math.round(Math.hypot(cx - CX, cy - CY))});
-      } catch (e) {}
-    }
-    for (const f of doc.querySelectorAll('iframe')) {
-      try { if (f.contentDocument) walk(f.contentDocument, depth + 1); } catch (e) {}
-    }
-  }
-  walk(document, 0);
-  out.sort((a, b) => a.d - b.d);        // 离点击位置最近的排前面
-  return JSON.stringify(out.slice(0, LIMIT));
-})()"""
-
-
-def page_info() -> str:
+def page_info(state_only: bool = False) -> str:
     """页面有多大、滚到哪了，拼成一句话塞给模型。
 
     模型只看得到视口这一屏。不告诉它"当前滚到 680px、下面还有 1560px"，
@@ -871,6 +740,13 @@ def page_info() -> str:
     **只报查得到的，查不到就直说查不到**。跨域 iframe 里的内容读不到
     （学习通课程列表就是），这时绝不能断言"页面只有一屏"——那是误导。
     变没变、有没有更多，最终以模型看到的画面为准。
+
+    state_only=True 时**只给最纯粹的几何状态**（视口、滚动位置、还能滚多少），
+    不带任何从 DOM 里挖出来的东西。调用方（run.py）用它来贯彻"只给图片 +
+    最基本网页状态"：学习通有字体加密，DOM 文字本来就不可信，喂过去只会带偏模型。
+
+    注意：这里不涉及"页面上有哪些元素"——元素坐标由代码自己从 DOM 查
+    （那部分是准的，不受字体影响），模型不需要看到。
     """
     try:
         raw = _require().eval(_PAGE_JS)
@@ -898,6 +774,27 @@ def page_info() -> str:
                          f"（要看就 scroll 正数，约 {max(1, left // _SCROLL_STEP)} 格）")
     else:
         parts.append("顶层文档只有一屏（不代表页面上没有更多内容）")
+
+    if state_only:
+        # 只多给一句"哪儿还能滚"——这是纯几何事实，不含任何页面文字，
+        # 而"要滚右侧目录"这件事光看截图是判断不出来的（各块区域各滚各的）
+        inners = d.get("inners")
+        if isinstance(inners, list) and inners:
+            desc = []
+            for it in inners[:3]:
+                try:
+                    left = int(it.get("left") or 0)
+                    ix, iy = int(it.get("x") or 0), int(it.get("y") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if left < 100:
+                    continue
+                desc.append(f"({ix}, {iy}) 处那块还能滚 {left}px")
+            if desc:
+                parts.append("页面上有独立的滚动区（**各自滚各自的**，"
+                             "要滚哪块就把 scroll 的 x/y 写到那块的坐标上）："
+                             + "；".join(desc))
+        return "；".join(parts)
 
     inners = d.get("inners")
     if isinstance(inners, list) and inners:

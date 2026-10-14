@@ -627,23 +627,20 @@ class Viewer(ctk.CTk):
                 if stale > 5.0:
                     self._ui("err", f"画面已经 {stale:.0f} 秒没更新了"
                                     f"（抓帧可能断了），下面这步的判断可能不准")
-                page = wc.page_info()
-                # 可点元素的清单（编号 + 文字）。图上有编号，但小字容易被网格或
-                # 相邻元素挡住，所以把清单也用文字给一份，两边对得上。
-                if elements:
-                    page = (f"{page}；【可点元素】（图上的红框数字就是编号，"
-                            f"点哪个就填 target=编号）：{_elements_text(elements)}"
-                            if page else _elements_text(elements))
-                # 视频的真实状态（有没有在播、进度多少）——模型光看截图分不清
-                # "正在播"和"已暂停"，会对着正在播的视频再点一下把它点停（踩过）
+                # 给模型的只有**图片 + 最基本的网页状态**（视口/滚动/视频在不在播）。
+                #
+                # **不喂任何从页面里爬出来的文字**。原因有两条：
+                # 1. 学习通用字体加密反爬——DOM 里存的是生僻字（"无论牵连璔憘作何
+                #    璔憘"），靠 font-cxsecret 字体画成正确的字。截图里是对的，
+                #    爬下来的文字是**错的**，喂过去只会把模型带偏。
+                # 2. 那些清单又长又占 token（元素 40 项 + 任务点 120 项能到上千 token），
+                #    实测还把关键信息稀释掉。
+                # 元素坐标仍然准确（不受字体影响），但那是**代码自己用来点击的**，
+                # 不需要模型知道——模型看着图上的红框编号选就行。
+                page = wc.page_info(state_only=True)
                 video = wc.video_info()
                 if video:
                     page = f"{page}；{video}" if page else video
-                # 目录里哪些任务点已完成——绿勾在截图里太小，模型容易看漏、
-                # 反复点已经做完的（实测踩过）
-                tasks = wc.tasks_info()
-                if tasks:
-                    page = f"{page}；{tasks}" if page else tasks
 
                 d = brain.decide(img, goal, extra=extra, page=page, frame_age=stale)
                 self._ui("ai", d.thought)
@@ -782,14 +779,13 @@ class Viewer(ctk.CTk):
                     wc.press_key(key)
                     desc = f"已按键 {key}"
                 out = desc + self._facts(before)
-                # 点了但页面没变 -> 很可能是坐标读偏了（模型靠看图估小元素的中心，
-                # 精度不够）。这时由程序把附近可点元素的**精确坐标**直接报给它，
-                # 让它挑一个，而不是继续瞎猜——实测点「章节测验」标签读成 280，
-                # 实际中心 214，偏 66px 点到隔壁，它还以为"页面没反应"。
+                # 点了但页面没变 -> 提醒模型"看看图上的编号，换个号重试"。
+                # **不在这里附元素文字**：那些文字是从 DOM 爬的，学习通有字体加密
+                # （DOM 里是生僻字、靠字体画成正确的字），爬来的就是错的，
+                # 喂过去只会把模型带偏。模型看着图上的红框编号重选即可。
                 if clicked_at and "没有" in out:
-                    near = wc.elements_near(*clicked_at)
-                    if near:
-                        out += "\n" + near
+                    out += ("\n（这次点击没引起变化。如果点偏了，看着图上那个位置"
+                            "附近有哪个红框编号，换个编号重试。）")
                 return out
 
             if t == "wait":
@@ -961,21 +957,10 @@ def _repeat_limits(action_type: str) -> "tuple[int, int]":
     return REPEAT_WARN, REPEAT_STOP
 
 
-def _elements_text(elements, limit: int = 60) -> str:
-    """把可点元素列成「编号 文字」给模型看。
-
-    图上已经画了编号，但小字容易被网格线或相邻元素挡住——文字版更保险，
-    两边对得上，模型选编号时就不会数错。
-    """
-    parts = []
-    for i, el in enumerate(elements[:limit], start=1):
-        t = str(el.get("t") or "").strip().replace("\n", " ")
-        tag = str(el.get("tag") or "")
-        w, h = int(el.get("w") or 0), int(el.get("h") or 0)
-        label = f"{t[:18]}" if t else f"<{tag}>"
-        parts.append(f"{i}={label}({w}x{h})")
-    return "，".join(parts)
-
+# （原来这里有个 _elements_text()，把可点元素列成「编号 文字」喂给模型。
+#  已删除：那些文字是从 DOM 爬的，学习通用字体加密反爬——DOM 里是生僻字
+#  （"无论牵连璔憘作何璔憘"），靠 font-cxsecret 字体才画成正确的字。
+#  图上的编号框已经够模型选，文字反而会带偏它。）
 
 def _action_sig(action: Dict[str, Any]) -> str:
     """给动作算一个"是不是同一件事"的签名，用来数重复次数。

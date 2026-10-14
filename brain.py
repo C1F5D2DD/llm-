@@ -319,8 +319,9 @@ def load_config() -> Optional[Dict[str, str]]:
 
 
 def init(base_url: str, api_key: str, model: str,
-         temperature: float = 0.15, max_tokens: int = 800,
-         timeout: float = 90.0, json_mode: bool = True) -> None:
+         temperature: float = 0.15, max_tokens: int = 1500,
+         timeout: float = 90.0, json_mode: bool = True,
+         reasoning_effort: str = "max") -> None:
     """配置模型并接管。失败抛 BrainError。
 
     base_url/api_key/model   OpenAI 兼容网关的三项配置
@@ -332,6 +333,16 @@ def init(base_url: str, api_key: str, model: str,
                             给一点随机性，它才有机会自己换个思路；
                             但也不能太高——这个任务要精确读网格坐标，
                             温度高了坐标会飘、JSON 也容易写坏。
+    reasoning_effort        **思考强度**，默认 "max"（最高档）。
+                            实测 DeepSeek 服务端认这个字段，合法值域是
+                            none/minimal/low/medium/high/xhigh/ultra/max
+                            （传非法值会 422 并把这些值列给你）。
+                            不传的话**完全没有思维链**（实测 3/3 都是 0 字）；
+                            传了之后模型会先想一段再给 JSON，决策质量更好。
+                            网关不支持时自动去掉重试，不会因此失败。
+    max_tokens              默认 1500（原来是 800）。**思考也占这个额度**——
+                            开了 reasoning 之后 completion_tokens 里包含
+                            reasoning_tokens，额度太小 JSON 会被截断。
     json_mode                True 时要求网关返回 JSON 对象；某些网关不支持，
                              报错了就传 False（这时靠提示词约束 + 容错解析）
 
@@ -354,9 +365,10 @@ def init(base_url: str, api_key: str, model: str,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "json_mode": json_mode,
+        "reasoning_effort": reasoning_effort,
     }
-    _log.info("配置模型：%s @ %s   json_mode=%s   日志→%s",
-              model, base_url, json_mode, LOG_PATH)
+    _log.info("配置模型：%s @ %s   json_mode=%s   reasoning_effort=%s   日志→%s",
+              model, base_url, json_mode, reasoning_effort or "(不传)", LOG_PATH)
 
 
 def _clean_base_url(url: str) -> str:
@@ -678,54 +690,67 @@ def _build_prompt(goal: str, extra: str, page: str = "", has_prev: bool = False,
 
 
 def _chat(messages: List[Dict[str, Any]]) -> Any:
-    """调一次模型，返回原始响应。网关不支持 JSON 模式时自动退回纯提示词。"""
+    """调一次模型，返回原始响应。
+
+    两个可选参数会"不支持就自动去掉"：response_format（JSON 模式）和
+    reasoning_effort（思考强度）。**只对参数类错误才降级**——401、超时
+    这类错误降级也没用，还会把真实原因埋掉（踩过）。
+    """
     kwargs: Dict[str, Any] = {
         "model": _model,
         "messages": messages,
         "temperature": _options.get("temperature", 0.15),
-        "max_tokens": _options.get("max_tokens", 800),
+        "max_tokens": _options.get("max_tokens", 1500),
     }
     if _options.get("json_mode", True):
         kwargs["response_format"] = {"type": "json_object"}
+    effort = _options.get("reasoning_effort")
+    if effort:
+        kwargs["reasoning_effort"] = effort
 
-    try:
-        resp = _client.chat.completions.create(**kwargs)
-    except Exception as exc:
-        # 只有"网关不认 response_format 这个参数"才值得去掉重试。
-        # 早期版本对任何失败都重试一次，结果 401、超时这类错误也被当成参数问题，
-        # 既浪费一次请求，又把真实原因埋在一句误导性的 WARNING 里（踩过）。
-        if "response_format" in kwargs and _is_param_error(exc):
-            _log.warning("网关不支持 response_format（%s），去掉重试一次", exc)
-            kwargs.pop("response_format")
-            try:
-                resp = _client.chat.completions.create(**kwargs)
-            except Exception as exc2:
-                msg = _explain(exc2)
-                _log.error("调用模型失败：%s", exc2)
-                raise BrainError(msg) from exc2
-        else:
+    for attempt in range(3):
+        try:
+            resp = _client.chat.completions.create(**kwargs)
+            break
+        except Exception as exc:
+            # 找出"哪个可选参数"可以去掉重试。一次只去一个，去掉后再试。
+            droppable = [k for k in ("response_format", "reasoning_effort") if k in kwargs]
+            if droppable and _is_param_error(exc):
+                k = droppable[0]
+                kwargs.pop(k)
+                _log.warning("网关不接受 %s（%s），去掉它重试", k, exc)
+                continue
             msg = _explain(exc)
             _log.error("调用模型失败：%s", exc)
             raise BrainError(msg) from exc
+    else:
+        raise BrainError("调用模型失败：可选参数都去掉了还是不行")
 
     _log_raw(resp)
     return resp
 
 
 def _is_param_error(exc: Exception) -> bool:
-    """判断这个错误是不是"参数不被支持"——只有这种才该去掉参数重试。
+    """判断这个错误是不是"某个可选参数不被支持"——只有这种才该去掉参数重试。
 
-    看 HTTP 状态码：400 通常是参数问题，401/403 是认证、429 是限流、5xx 是服务端，
-    这些重试也没用，而且会让错误信息变得难懂。
+    看 HTTP 状态码：400/422 通常是参数问题（422 是"字段不认识/值不合法"），
+    401/403 是认证、429 是限流、5xx 是服务端，这些重试也没用，
+    而且会让错误信息变得难懂。
+
+    另外按错误文字兜一层：有些网关把参数错误包成别的码，
+    但消息里会提 response_format / json_object / reasoning_effort
+    这类字段名，见到就当参数问题处理。
     """
     code = getattr(exc, "status_code", None)
     if code is None:
         resp = getattr(exc, "response", None)
         code = getattr(resp, "status_code", None)
-    if code == 400:
+    if code in (400, 422):
         return True
     text = str(exc).lower()
-    return "response_format" in text or "json_object" in text
+    return any(k in text for k in ("response_format", "json_object",
+                                   "reasoning_effort", "unknown variant",
+                                   "unexpected keyword"))
 
 
 def _explain(exc: Exception) -> str:

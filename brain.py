@@ -22,13 +22,15 @@ import io
 import json
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
 
 from PIL import Image
 
-__all__ = ["init", "decide", "reset", "note_result", "note_hint", "turn_elapsed",
+__all__ = ["init", "decide", "reset", "set_stream_handler",
+           "note_result", "note_hint", "turn_elapsed",
            "save_config", "load_config",
            "BrainError", "Decision", "ACTIONS", "LOG_PATH"]
 
@@ -277,6 +279,43 @@ _turn_started: Optional[float] = None     # 本段对话的起点，用来算"�
 # 按钮变灰这些变化它一概看不见，硬下结论只会误导（实测把它当成"没变化"
 # 去告诉模型，模型就反复重试同一个动作）。
 _last_frame: Optional[str] = None
+
+# 流式输出的回调。设了它，模型边吐字边回调，界面就能实时显示它"正在想什么"。
+# 为什么要这个：开了 reasoning_effort 之后模型会先想很久（实测最多 2.5 万字），
+# 非流式调用时这一整段只能等它全吐完才拿到，中间界面上什么都不显示、
+# 看着像卡死了；出了问题（比如思考吃光额度）也只能看到一句"思考 N 字"，
+# 完全不知道它在想什么。流式能让这段过程可见、可判断。
+_stream_handler = None      # callable(kind: str, text: str)
+_stream_lock = threading.Lock()
+
+
+def set_stream_handler(fn) -> None:
+    """设置流式回调：模型边说边回调，用来实时显示。
+
+    fn(kind, text)：
+      kind = "think"   模型的思考过程（reasoning）
+      kind = "content" 正文（就是我们最终要解析的那段 JSON）
+    text 是这一小片新增的文字，可能很短（一两个词）。
+
+    **回调可能在别的线程里被调用**（decide 跑在工作线程），
+    所以回调里别直接碰 tkinter，要做的事丢给 after()。
+    传 None 关掉流式回调。
+    """
+    global _stream_handler
+    with _stream_lock:
+        _stream_handler = fn
+
+
+def _emit(kind: str, text: str) -> None:
+    """把一小片输出交给回调。回调里出错不能影响主流程。"""
+    with _stream_lock:
+        fn = _stream_handler
+    if fn is None or not text:
+        return
+    try:
+        fn(kind, text)
+    except Exception:
+        pass
 
 
 def save_config(base_url: str, api_key: str, model: str) -> Path:
@@ -718,12 +757,15 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
         kwargs["reasoning_effort"] = effort
     downgrades = 0            # 因为"思考吃光额度"降了几次档
 
-    # 逐步降档的顺序：max -> high -> medium -> low -> minimal -> 去掉参数
+    # 逐步降档的顺序。**要跳着降**：max/ultra/xhigh 是相邻的"极高"档，
+    # 实测 max->ultra 思考量几乎没变（25794 字 vs 25855 字），白白多花一次请求
+    # 和 47 秒。所以直接从 max 跳到 high 那一级。
     LADDER = ["max", "ultra", "xhigh", "high", "medium", "low", "minimal"]
+    SKIP = {"max": "high", "ultra": "high", "xhigh": "medium"}
 
     for attempt in range(8):
         try:
-            resp = _client.chat.completions.create(**kwargs)
+            resp = _stream_once(kwargs, seen_any=attempt > 0)
         except Exception as exc:
             # 找出"哪个可选参数"可以去掉重试。一次只去一个，去掉后再试。
             droppable = [k for k in ("response_format", "reasoning_effort") if k in kwargs]
@@ -742,33 +784,112 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
             content = (ch.message.content or "").strip()
             think = getattr(ch.message, "reasoning_content", None) or ""
         except Exception:
+            _log_raw(resp)
             return resp
         if content or not think:
+            _log_raw(resp)
             return resp
         if getattr(ch, "finish_reason", "") != "length":
+            _log_raw(resp)
             return resp
 
-        # 思考吃光了额度 -> 再降一档重试。
-        # 实测：一页字体反爬的乱码文字会让模型陷入超长思考（25000 字），
-        # 降一档（max->high）都还不够，所以这里做成**逐级下降**，
-        # 直到出正文或者降到不能再降。每次都记日志，方便看出是哪一档救回来的。
+        # 思考吃光了额度 -> 降档重试。
+        # **先把这次思考的内容存下来**：看不到它在想什么，就只能瞎猜
+        # （实测踩过：只知道"思考了 25794 字"，完全不知道它是在解物理题
+        #  还是在原地打转，没法判断该加额度还是该降档）。
+        _dump_long_think(think, attempt + 1)
         cur = str(kwargs.get("reasoning_effort") or "").lower()
-        if cur in LADDER:
+        lower = SKIP.get(cur)
+        if lower is None and cur in LADDER:
             nxt = LADDER[LADDER.index(cur) + 1:]
             lower = nxt[0] if nxt else None
-        else:
-            lower = None
         if lower is None:
+            _log_raw(resp)
             return resp          # 已经降到最低，就这样吧
         downgrades += 1
         kwargs["reasoning_effort"] = lower
         _log.warning("思考把 max_tokens 吃光了（第 %d 次：思考 %d 字、正文 0 字），"
-                     "思考强度 %s -> %s 重试", downgrades, len(think), cur, lower)
+                     "思考强度 %s -> %s 重试（思考全文已存到 runs/long_think.txt）",
+                     downgrades, len(think), cur, lower)
 
     raise BrainError("调用模型失败：一路降档重试都没拿到正文")
 
-    _log_raw(resp)
-    return resp
+
+def _dump_long_think(think: str, n: int) -> None:
+    """把吃光额度的思考内容存一份，方便看它到底在想什么。
+
+    这是排查这类问题的唯一线索：日志里只有"思考 N 字"，看不出它是
+    在认真解题、还是在原地打转。存下来才能判断该加额度还是该降档。
+    """
+    try:
+        p = LOG_PATH.parent / "long_think.txt"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        head = think[:2000]
+        tail = think[-2000:] if len(think) > 2000 else ""
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"\n{'=' * 70}\n第 {n} 次超长思考，共 {len(think)} 字\n"
+                    f"--- 开头 2000 字 ---\n{head}\n")
+            if tail:
+                f.write(f"\n--- 结尾 2000 字（看它是不是在打转）---\n{tail}\n")
+        _log.error("超长思考已存到 %s", p)
+    except Exception as exc:
+        _log.warning("存超长思考失败：%s", exc)
+
+
+def _stream_once(kwargs: Dict[str, Any], seen_any: bool = False):
+    """流式跑一次，边收边回调，最后拼出一个和"非流式响应"同形的对象。
+
+    为什么要拼成同形：调用方（_chat / _parse / _log_raw）原来是按非流式写的，
+    拼一个同结构的对象出去，那些代码一行都不用改。
+
+    为什么要流式：开了高思考强度后模型会先想很久（实测最多 2.5 万字），
+    非流式要等它全吐完才拿到——中间界面一片空白，看着像卡死，
+    出问题时也只能看到"思考 N 字"这种没信息量的结论。流式让过程可见。
+
+    seen_any=True 表示这是重试：把新的一轮跟前一轮的输出用分隔线隔开，
+    否则界面上两轮的思考会连成一片，看不出是在重试。
+    """
+    from types import SimpleNamespace
+
+    think_parts: List[str] = []
+    content_parts: List[str] = []
+    finish = None
+    usage = None
+
+    if seen_any:
+        _emit("think", "\n\n——— 上一轮思考把额度用光了，正在降低思考强度重试 ———\n\n")
+
+    stream = _client.chat.completions.create(stream=True, **kwargs)
+    for chunk in stream:
+        # 用量信息通常在最后一个 chunk（要 stream_options 才给，没有就算了）
+        u = getattr(chunk, "usage", None)
+        if u is not None:
+            usage = u
+        if not getattr(chunk, "choices", None):
+            continue
+        ch = chunk.choices[0]
+        if getattr(ch, "finish_reason", None):
+            finish = ch.finish_reason
+        delta = getattr(ch, "delta", None)
+        if delta is None:
+            continue
+
+        # 思考链（DeepSeek 走 reasoning_content；有些网关用 reasoning）
+        piece = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+        if piece:
+            think_parts.append(piece)
+            _emit("think", piece)
+        # 正文
+        piece = getattr(delta, "content", None)
+        if piece:
+            content_parts.append(piece)
+            _emit("content", piece)
+
+    think = "".join(think_parts)
+    content = "".join(content_parts)
+    msg = SimpleNamespace(content=content, reasoning_content=think or None)
+    choice = SimpleNamespace(message=msg, finish_reason=finish or "stop")
+    return SimpleNamespace(choices=[choice], usage=usage)
 
 
 def _is_param_error(exc: Exception) -> bool:

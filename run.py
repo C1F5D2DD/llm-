@@ -70,6 +70,9 @@ _STYLE = {
     "done": ("■", "#b36a1e", True),
     "ask": ("?", "#b36a1e", False),
     "note": ("·", "#6b7280", False),
+    # 模型的实时思考/正文（流式）。用浅灰，和正式消息区分开——
+    # 它们只是过程，最终结论会以 "ai" 再发一条
+    "think": ("…", "#9aa0a6", False),
 }
 
 
@@ -193,6 +196,11 @@ class Viewer(ctk.CTk):
         self._chat_h = 0            # 对话区已占高度（px），超 CHAT_MAX_PX 就丢老的
         self._wrap_cur = 0          # 当前用的折行宽度，跟新算出来的一样就不折腾
         self._wrap_pending = False  # 已排了一个重新折行的回调
+        # 流式显示：模型的思考/正文逐片到达，攒成一条"活气泡"原地更新
+        self._stream_label = None   # 当前那条活气泡（None 表示还没开）
+        self._stream_buf = ""       # 已经攒下的文字
+        self._stream_kind = ""      # "think" 还是 "content"
+        self._stream_dirty = False  # 有新内容待贴（不用它，留作排查用）
 
         # ---- 左栏下方：控制面板 ----
         self.panel = ctk.CTkFrame(self.left, corner_radius=16, fg_color="#83a2eb",
@@ -448,6 +456,64 @@ class Viewer(ctk.CTk):
         """子线程安全地追加一条对话。"""
         self.after(0, lambda: self._say(kind, text))
 
+    # ---------- 流式显示 ----------
+    def _stream(self, kind: str, text: str) -> None:
+        """接收模型流式输出的一小片（在工作线程里被调用）。
+
+        **不能每片都新建一条消息**——模型一次会说几百片（实测思考 197 片、
+        正文 66 片），每条一个控件会把对话区瞬间撑爆，而且每片都要重排布局，
+        界面直接卡死。所以攒成一条"正在输出"的活气泡，原地更新文字。
+        """
+        self.after(0, lambda: self._stream_append(kind, text))
+
+    def _stream_append(self, kind: str, text: str) -> None:
+        """把一小片追加到当前那条活气泡上（主线程）。"""
+        if self._closing or not text:
+            return
+        label = self._stream_label
+        if label is None:
+            # 开一条新的活气泡。用 think 样式但开头标明是"正在想/正在写"
+            prefix, color, bold = _STYLE["think"]
+            font = ("Microsoft YaHei", 12)
+            label = ctk.CTkLabel(self.chat, text="", anchor="w", justify="left",
+                                 wraplength=self._chat_wrap(), font=font,
+                                 text_color=color)
+            label.pack(fill="x", padx=6, pady=2, anchor="w")
+            self._stream_label = label
+            self._stream_buf = ""
+            self._stream_kind = kind
+        elif kind != self._stream_kind:
+            # 思考结束、开始写正文：换行分隔，别糊在一起
+            self._stream_buf += "\n——— 开始输出正文 ———\n"
+            self._stream_kind = kind
+
+        self._stream_buf += text
+        # 只显示末尾一段：思考能到两万多字，全塞进一个 Label 会让控件巨大、
+        # 滚动也卡。反正界面上只需要看它"在想什么"，前面的可以滚走。
+        shown = self._stream_buf
+        if len(shown) > 3000:
+            shown = "…（前面略）…\n" + shown[-3000:]
+        prefix = "⟳ 模型输出中…" if self._stream_kind == "think" else "⟳ 模型正在写正文"
+        try:
+            label.configure(text=f"{prefix}\n{shown}")
+        except Exception:
+            pass
+        self._stream_dirty = True
+
+    def _stream_flush(self) -> None:
+        """活气泡收尾：把高度记账一次，然后交给下一条。"""
+        label = self._stream_label
+        self._stream_label = None
+        if label is None:
+            return
+        try:
+            self._chat_h += max(0, label.winfo_reqheight())
+            self._chat_trim()
+        except Exception:
+            pass
+        self._stream_buf = ""
+        self._scroll_bottom()
+
     def _set_buttons(self, busy: bool) -> None:
         if busy:
             self.send_btn.configure(text="运行中", state="disabled")
@@ -604,6 +670,8 @@ class Viewer(ctk.CTk):
 
         这里绝不碰 tkinter，所有界面更新都走 self._ui（内部用 after(0, ...)。
         """
+        # 打开流式显示：模型边想边往界面上贴，长思考时不再一片空白
+        brain.set_stream_handler(self._stream)
         try:
             while not self._stop_evt.is_set():
                 limit = self._turn_limit()
@@ -643,6 +711,8 @@ class Viewer(ctk.CTk):
                     page = f"{page}；{video}" if page else video
 
                 d = brain.decide(img, goal, extra=extra, page=page, frame_age=stale)
+                # 这一步想完了，把"模型输出中"那条活气泡收尾
+                self.after(0, self._stream_flush)
                 self._ui("ai", d.thought)
                 self._ui("act", _action_text(d.action))
 
@@ -704,6 +774,8 @@ class Viewer(ctk.CTk):
             self._ui("err", f"出错：{type(exc).__name__}: {exc}")
         finally:
             self._running = False
+            brain.set_stream_handler(None)      # 关掉流式回调，别让它往已结束的回合里贴字
+            self.after(0, self._stream_flush)
             self.after(0, lambda: self._set_buttons(busy=False))
 
     def _drain_inbox(self) -> str:

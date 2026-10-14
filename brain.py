@@ -319,7 +319,7 @@ def load_config() -> Optional[Dict[str, str]]:
 
 
 def init(base_url: str, api_key: str, model: str,
-         temperature: float = 0.15, max_tokens: int = 1500,
+         temperature: float = 0.15, max_tokens: int = 8000,
          timeout: float = 90.0, json_mode: bool = True,
          reasoning_effort: str = "max") -> None:
     """配置模型并接管。失败抛 BrainError。
@@ -340,9 +340,11 @@ def init(base_url: str, api_key: str, model: str,
                             不传的话**完全没有思维链**（实测 3/3 都是 0 字）；
                             传了之后模型会先想一段再给 JSON，决策质量更好。
                             网关不支持时自动去掉重试，不会因此失败。
-    max_tokens              默认 1500（原来是 800）。**思考也占这个额度**——
-                            开了 reasoning 之后 completion_tokens 里包含
-                            reasoning_tokens，额度太小 JSON 会被截断。
+    max_tokens              默认 8000。**思考也占这个额度**——开了 reasoning
+                            之后 completion_tokens 里包含 reasoning_tokens。
+                            实测踩过：给 1500，模型在一页乱码文字上思考了 1499
+                            token，**正文一个字没剩**，解析失败、界面只显示
+                            一句 BrainError。给宽裕点；API 实测接受 16000。
     json_mode                True 时要求网关返回 JSON 对象；某些网关不支持，
                              报错了就传 False（这时靠提示词约束 + 容错解析）
 
@@ -692,26 +694,34 @@ def _build_prompt(goal: str, extra: str, page: str = "", has_prev: bool = False,
 def _chat(messages: List[Dict[str, Any]]) -> Any:
     """调一次模型，返回原始响应。
 
-    两个可选参数会"不支持就自动去掉"：response_format（JSON 模式）和
-    reasoning_effort（思考强度）。**只对参数类错误才降级**——401、超时
-    这类错误降级也没用，还会把真实原因埋掉（踩过）。
+    两条自动补救：
+    1. **可选参数不被支持就去掉重试**（response_format / reasoning_effort）。
+       只对参数类错误才降级——401、超时这类降级也没用，还会把真实原因埋掉（踩过）。
+    2. **思考把额度吃光、正文为空时，降一档思考强度重试**。
+       实测踩过：一页字体反爬的乱码文字（"无论牵连璔憘作何璔憘…"），
+       模型思考了 23179 字把 8000 token 全用光，正文一个字没剩，
+       整个决策直接失败。这种时候加额度治不了本（它想多长是多长），
+       降一档让它收敛更实际。
     """
     kwargs: Dict[str, Any] = {
         "model": _model,
         "messages": messages,
         "temperature": _options.get("temperature", 0.15),
-        "max_tokens": _options.get("max_tokens", 1500),
+        "max_tokens": _options.get("max_tokens", 8000),
     }
     if _options.get("json_mode", True):
         kwargs["response_format"] = {"type": "json_object"}
     effort = _options.get("reasoning_effort")
     if effort:
         kwargs["reasoning_effort"] = effort
+    downgrades = 0            # 因为"思考吃光额度"降了几次档
 
-    for attempt in range(3):
+    # 逐步降档的顺序：max -> high -> medium -> low -> minimal -> 去掉参数
+    LADDER = ["max", "ultra", "xhigh", "high", "medium", "low", "minimal"]
+
+    for attempt in range(8):
         try:
             resp = _client.chat.completions.create(**kwargs)
-            break
         except Exception as exc:
             # 找出"哪个可选参数"可以去掉重试。一次只去一个，去掉后再试。
             droppable = [k for k in ("response_format", "reasoning_effort") if k in kwargs]
@@ -723,8 +733,37 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
             msg = _explain(exc)
             _log.error("调用模型失败：%s", exc)
             raise BrainError(msg) from exc
-    else:
-        raise BrainError("调用模型失败：可选参数都去掉了还是不行")
+
+        # 调用成功了，但要看正文是不是空的（思考吃光额度的典型症状）
+        try:
+            ch = resp.choices[0]
+            content = (ch.message.content or "").strip()
+            think = getattr(ch.message, "reasoning_content", None) or ""
+        except Exception:
+            return resp
+        if content or not think:
+            return resp
+        if getattr(ch, "finish_reason", "") != "length":
+            return resp
+
+        # 思考吃光了额度 -> 再降一档重试。
+        # 实测：一页字体反爬的乱码文字会让模型陷入超长思考（25000 字），
+        # 降一档（max->high）都还不够，所以这里做成**逐级下降**，
+        # 直到出正文或者降到不能再降。每次都记日志，方便看出是哪一档救回来的。
+        cur = str(kwargs.get("reasoning_effort") or "").lower()
+        if cur in LADDER:
+            nxt = LADDER[LADDER.index(cur) + 1:]
+            lower = nxt[0] if nxt else None
+        else:
+            lower = None
+        if lower is None:
+            return resp          # 已经降到最低，就这样吧
+        downgrades += 1
+        kwargs["reasoning_effort"] = lower
+        _log.warning("思考把 max_tokens 吃光了（第 %d 次：思考 %d 字、正文 0 字），"
+                     "思考强度 %s -> %s 重试", downgrades, len(think), cur, lower)
+
+    raise BrainError("调用模型失败：一路降档重试都没拿到正文")
 
     _log_raw(resp)
     return resp
@@ -787,15 +826,29 @@ def _log_raw(resp) -> None:
     try:
         ch = resp.choices[0]
         content = ch.message.content or ""
+        # 思考链单独记：开了 reasoning_effort 之后，**思考也吃 max_tokens 的额度**。
+        # 实测踩过：思考把 1500 全用光、正文 0 字，解析直接失败，界面上只显示
+        # 一句"BrainError"看不出原因。所以这里把思考长度也报出来，
+        # 下次一看日志就知道是不是这个原因。
+        think = getattr(ch.message, "reasoning_content", None) or ""
         finish = getattr(ch, "finish_reason", "?")
         usage = getattr(resp, "usage", None)
-        _log.debug("响应：finish_reason=%s tokens=%s/%s 长度=%d\n--- 原始返回 ---\n%s\n--- 结束 ---",
+        det = getattr(usage, "completion_tokens_details", None)
+        r_tok = getattr(det, "reasoning_tokens", None) if det else None
+        _log.debug("响应：finish_reason=%s tokens=%s/%s 思考=%s字(%stok) 正文=%d字"
+                   "\n--- 原始返回 ---\n%s\n--- 结束 ---",
                    finish,
                    getattr(usage, "prompt_tokens", "?"), getattr(usage, "completion_tokens", "?"),
+                   len(think), r_tok if r_tok is not None else "?",
                    len(content), content)
         if finish == "length":
-            _log.warning("返回被 max_tokens 截断了（finish_reason=length）——"
-                         "调大 brain.init(max_tokens=...) 或让提示词更简短")
+            if not content.strip():
+                _log.error("**思考把 max_tokens 用光了**（思考 %d 字），正文一个字都没有。"
+                           "解决办法：调大 brain.init(max_tokens=...)，"
+                           "或者把 reasoning_effort 降到 medium/high。", len(think))
+            else:
+                _log.warning("返回被 max_tokens 截断了（finish_reason=length）——"
+                             "调大 brain.init(max_tokens=...) 或让提示词更简短")
     except Exception as exc:
         _log.warning("记录原始返回失败：%s", exc)
 
@@ -821,6 +874,13 @@ def _parse(resp) -> Decision:
     obj = _extract_json(content)
     if obj is None:
         _dump_bad_reply(content)
+        # 正文为空是最常见也最容易被误解的一种：不是模型乱答，是**额度被思考吃光了**。
+        # 不把这点说清楚的话，界面上只有一句"返回的不是合法 JSON"，完全看不出方向。
+        if not content.strip():
+            raise BrainError(
+                "模型这次只输出了思考、没输出正文（思考把 max_tokens 用光了）。"
+                "解决办法：调大 brain.init(max_tokens=...)，"
+                "或把 reasoning_effort 降到 medium/high")
         raise BrainError(f"模型返回的不是合法 JSON：{content[:200]}")
 
     action = obj.get("action") or {}

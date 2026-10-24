@@ -8,6 +8,12 @@
 """
 from __future__ import annotations
 
+import warnings
+# 画面用裸 PhotoImage + paste 原地更新（性能考量，见 refresh 里的说明）。
+# CTkLabel 见到非 CTkImage 会警告"HighDPI 不能缩放"——我们按物理像素贴，
+# 尺寸本来就是对的，这条警告没有意义，滤掉。
+warnings.filterwarnings("ignore", message=".*not CTkImage.*")
+
 import json
 import queue
 import subprocess
@@ -19,6 +25,8 @@ from pathlib import Path
 from typing import Any, Dict
 
 import customtkinter as ctk
+from PIL import Image as _PilImage, ImageTk
+from PIL.Image import BILINEAR as Image_BILINEAR
 
 import brain
 import pageCapture as capture
@@ -33,6 +41,13 @@ MAX_STEPS = 50         # 一个回合最多跑多少步，防止模型停不下�
 MAX_WAIT = 600.0        # 单次 wait 的上限（秒）。看视频要等很久，这个得放得够大；
                         # 提示词里告诉模型的数字要和这里一致，否则它按 600 规划、程序只等 30
 WAIT_SLICE = 0.2         # wait 分片检查停止信号的间隔
+
+# 思考强度候选。**服务端认这些值**——传别的会被 422 拒绝，
+# 错误信息里会把合法值列出来（实测拿非法值试探出来的）。
+# 顺序按"从省到费"排，界面上好挑。
+# 默认 high 而不是 max：max 只是"想得更久"不是"想得更对"（见 cfg_row 那段注释）。
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max")
+DEFAULT_EFFORT = "high"
 
 # 同一个动作重复太多次怎么办。**不能直接掐断**——"重复多少次算太多"跟任务
 # 有关：翻长列表往上滚 15 次完全正常（实测就是这么误伤过一次，模型在找第 1 题，
@@ -172,7 +187,8 @@ class Viewer(ctk.CTk):
         self.screen.grid(row=1, column=0, sticky="nw", padx=4)
 
         self._size = None       # 画面显示尺寸（逻辑像素），每帧按左栏宽度算
-        self._img = None        # 当前的 CTkImage
+        self._photo = None      # 画面用的 PhotoImage：只建一次，之后 paste 原地更新
+        self._photo_size = None # 当前 photo 的物理尺寸（变了才重建）
         self._winsize = None    # 首帧定过窗口尺寸后就置真，不再重复设
         self._err = 0
         self._closing = False   # 关窗时置真，让 after 循环停下
@@ -198,9 +214,12 @@ class Viewer(ctk.CTk):
         self._wrap_pending = False  # 已排了一个重新折行的回调
         # 流式显示：模型的思考/正文逐片到达，攒成一条"活气泡"原地更新
         self._stream_label = None   # 当前那条活气泡（None 表示还没开）
+        # 流式片的队列：工作线程只往里塞（list.append 原子），主线程的
+        # _stream_tick 每 150ms 取一次。**绝不能**每片都 after(0) 一次——
+        # 一次长输出 ~1000 片，主线程会被打成一千次重排，界面直接卡死（踩过）。
+        self._stream_q: list = []
         self._stream_buf = ""       # 已经攒下的文字
         self._stream_kind = ""      # "think" 还是 "content"
-        self._stream_dirty = False  # 有新内容待贴（不用它，留作排查用）
 
         # ---- 左栏下方：控制面板 ----
         self.panel = ctk.CTkFrame(self.left, corner_radius=16, fg_color="#83a2eb",
@@ -237,6 +256,18 @@ class Viewer(ctk.CTk):
                      font=("Microsoft YaHei", 12)).pack(side="right")
         ctk.CTkLabel(cfg_row, text="最大轮数", anchor="e",
                      font=("Microsoft YaHei", 12)).pack(side="right", padx=(0, 6))
+
+        # 思考强度（reasoning_effort）：**别默认 max**。
+        # 实测同一道理论力学题：max 档它反反复复验算 2.6 万字，把 token 额度
+        # 吃光、正文一个字没剩，页面全程一动不动；降到 high 只想了 784 字就
+        # 把题目读得一清二楚并给出动作。max 是"想得更久"不是"想得更对"。
+        self.effort = ctk.StringVar(value=DEFAULT_EFFORT)
+        ctk.CTkOptionMenu(cfg_row, variable=self.effort, values=list(EFFORTS),
+                          width=96, height=26, font=("Microsoft YaHei", 12),
+                          dropdown_font=("Microsoft YaHei", 12)).pack(
+            side="left", padx=(10, 0))
+        ctk.CTkLabel(cfg_row, text="思考强度", anchor="e",
+                     font=("Microsoft YaHei", 12)).pack(side="left", padx=(10, 4))
 
         ctk.CTkLabel(self.panel, text="点击 / 滚动测试", anchor="w",
                      font=("Microsoft YaHei", 13, "bold")).grid(
@@ -320,6 +351,7 @@ class Viewer(ctk.CTk):
         self._set_buttons(busy=False)
 
         self.after(100, self.refresh)
+        self.after(150, self._stream_tick)   # 流式显示的节流贴字循环
 
     # ---------- 对话区 ----------
     def _chat_wrap(self) -> int:
@@ -460,34 +492,55 @@ class Viewer(ctk.CTk):
     def _stream(self, kind: str, text: str) -> None:
         """接收模型流式输出的一小片（在工作线程里被调用）。
 
-        **不能每片都新建一条消息**——模型一次会说几百片（实测思考 197 片、
-        正文 66 片），每条一个控件会把对话区瞬间撑爆，而且每片都要重排布局，
-        界面直接卡死。所以攒成一条"正在输出"的活气泡，原地更新文字。
+        **这里只做一件事：往队列里塞。** 不能在这儿碰 tkinter——
+        早先每片都 after(0) 一次、主线程随后把整个 3000 字的 Label 重配一遍
+        （重排折行很贵）。一次长输出有 ~1000 片（实测思考 576 + 正文 482），
+        主线程被打成一千次小重排，期间什么都干不了——用户看到的就是
+        "模型一长输出整条界面就卡死"。改成入队 + _stream_tick 每 150ms
+        取一次、只贴一次，主线程最多每秒 7 次更新，怎么都不卡。
+        list.append 是原子操作，跨线程塞安全。
         """
-        self.after(0, lambda: self._stream_append(kind, text))
+        if text:
+            self._stream_q.append((kind, text))
 
-    def _stream_append(self, kind: str, text: str) -> None:
-        """把一小片追加到当前那条活气泡上（主线程）。"""
-        if self._closing or not text:
+    def _stream_tick(self) -> None:
+        """每 150ms 把队列里攒的片一次性贴到活气泡上（主线程）。"""
+        if self._closing:
             return
+        try:
+            if self._stream_q:
+                self._stream_drain()
+        except Exception:
+            pass
+        self.after(150, self._stream_tick)
+
+    def _stream_drain(self) -> None:
+        """把队列里所有片合并成一次 Label 更新。"""
+        items = []
+        while self._stream_q:
+            items.append(self._stream_q.pop(0))
+        if not items:
+            return
+
         label = self._stream_label
         if label is None:
-            # 开一条新的活气泡。用 think 样式但开头标明是"正在想/正在写"
-            prefix, color, bold = _STYLE["think"]
-            font = ("Microsoft YaHei", 12)
+            # 开一条新的活气泡
+            _, color, _ = _STYLE["think"]
             label = ctk.CTkLabel(self.chat, text="", anchor="w", justify="left",
-                                 wraplength=self._chat_wrap(), font=font,
-                                 text_color=color)
+                                 wraplength=self._chat_wrap(),
+                                 font=("Microsoft YaHei", 12), text_color=color)
             label.pack(fill="x", padx=6, pady=2, anchor="w")
             self._stream_label = label
             self._stream_buf = ""
-            self._stream_kind = kind
-        elif kind != self._stream_kind:
-            # 思考结束、开始写正文：换行分隔，别糊在一起
-            self._stream_buf += "\n——— 开始输出正文 ———\n"
-            self._stream_kind = kind
+            self._stream_kind = items[0][0]
 
-        self._stream_buf += text
+        for kind, text in items:
+            if kind != self._stream_kind:
+                # 思考结束、开始写正文：换行分隔，别糊在一起
+                self._stream_buf += "\n——— 开始输出正文 ———\n"
+                self._stream_kind = kind
+            self._stream_buf += text
+
         # 只显示末尾一段：思考能到两万多字，全塞进一个 Label 会让控件巨大、
         # 滚动也卡。反正界面上只需要看它"在想什么"，前面的可以滚走。
         shown = self._stream_buf
@@ -498,10 +551,15 @@ class Viewer(ctk.CTk):
             label.configure(text=f"{prefix}\n{shown}")
         except Exception:
             pass
-        self._stream_dirty = True
+        self._scroll_bottom()
 
     def _stream_flush(self) -> None:
-        """活气泡收尾：把高度记账一次，然后交给下一条。"""
+        """活气泡收尾：把剩下的片贴完，记账一次，然后交给下一条。"""
+        try:
+            if self._stream_q:
+                self._stream_drain()
+        except Exception:
+            pass
         label = self._stream_label
         self._stream_label = None
         if label is None:
@@ -649,7 +707,8 @@ class Viewer(ctk.CTk):
             self._say("err", "先在左边填好 接口地址 / 密钥 / 模型")
             return False
         try:
-            brain.init(base_url=base_url, api_key=api_key, model=model)
+            brain.init(base_url=base_url, api_key=api_key, model=model,
+                       reasoning_effort=self.effort.get().strip() or DEFAULT_EFFORT)
         except Exception as exc:
             self._say("err", f"初始化失败：{exc}")
             return False
@@ -970,13 +1029,21 @@ class Viewer(ctk.CTk):
             avail_w = max(200, lw - 20)
             avail_h = max(150, lh - panel_h - 60)
             k = min(avail_w / w, avail_h / h, 1.0)
-            self._size = (max(1, int(w * k)), max(1, int(h * k)))
-            self.screen.configure(width=self._size[0], height=self._size[1])
+            # 显示尺寸（逻辑像素）。PhotoImage 粘贴用物理像素，所以这里乘回缩放比
+            dw = max(1, int(w * k))
+            dh = max(1, int(h * k))
 
-            # CTkImage 的 size 用逻辑像素，它会按屏幕缩放自己放大到物理像素
-            self._img = ctk.CTkImage(light_image=img, dark_image=img,
-                                     size=self._size)
-            self.screen.configure(image=self._img, text="")
+            # **不要每帧新建 CTkImage**：它会从原图重新缩放出整套 PhotoImage
+            # （1360x748 的图每 150ms 缩放一次，实测把主线程拖得很沉——
+            # 项目记忆里记过的性能陷阱）。正解：PhotoImage 只建一次，
+            # 以后 photo.paste(缩小后的帧) 原地替换，零新建、零缩放缓存失效。
+            phys = (max(1, int(dw * sc)), max(1, int(dh * sc)))
+            if self._photo is None or self._photo_size != phys:
+                self._photo = ImageTk.PhotoImage(_PilImage.new("RGB", phys))
+                self._photo_size = phys
+                self.screen.configure(image=self._photo, text="")
+            self._photo.paste(img.resize(phys, Image_BILINEAR))
+            self.screen.configure(width=dw, height=dh)
         except Exception as exc:
             self._err += 1
             if self._err <= 3:
@@ -992,6 +1059,10 @@ class Viewer(ctk.CTk):
         self.base_url.set(cfg["base_url"])
         self.api_key.set(cfg["api_key"])
         self.model.set(cfg["model"])
+        # 思考强度是后加的项，老配置里没有——有就用存的，没有保持界面默认
+        eff = str(cfg.get("reasoning_effort") or "").strip()
+        if eff in EFFORTS:
+            self.effort.set(eff)
         self.cfg_hint.configure(text="已加载保存的配置")
 
     def on_save_config(self) -> None:
@@ -1004,7 +1075,8 @@ class Viewer(ctk.CTk):
         try:
             brain.save_config(self.base_url.get().strip(),
                               self.api_key.get().strip(),
-                              self.model.get().strip())
+                              self.model.get().strip(),
+                              self.effort.get().strip())
         except Exception as exc:
             self.cfg_hint.configure(text=f"保存失败：{exc}", text_color="#b3261e")
             return

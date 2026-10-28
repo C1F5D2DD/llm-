@@ -329,11 +329,15 @@ def _emit(kind: str, text: str) -> None:
         pass
 
 
-def save_config(base_url: str, api_key: str, model: str) -> Path:
+def save_config(base_url: str, api_key: str, model: str,
+                reasoning_effort: str = "") -> Path:
     """把这套 API 配置存下来，下次启动自动读。
 
     三项都必须给，不然存了也没用。文件里含 api_key，注意别提交到版本库
     （.gitignore 里已经排除）。
+
+    reasoning_effort 是可选的第 4 项（思考强度）。不给就不写进文件——
+    老配置读回来时没有这项也要能正常工作，所以它不参与下面的必填校验。
     """
     if not (base_url and api_key and model):
         raise BrainError("三项都要填才能保存")
@@ -343,6 +347,8 @@ def save_config(base_url: str, api_key: str, model: str) -> Path:
         "api_key": api_key.strip(),
         "model": model.strip(),
     }
+    if reasoning_effort:
+        data["reasoning_effort"] = reasoning_effort.strip()
     try:
         CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                encoding="utf-8")
@@ -367,6 +373,10 @@ def load_config() -> Optional[Dict[str, str]]:
     got = {k: str(data.get(k, "")) for k in ("base_url", "api_key", "model")}
     if not all(got.values()):
         return None
+    # 思考强度是后加的，老配置里没有——有就带上，没有就算了
+    eff = str(data.get("reasoning_effort", "") or "").strip()
+    if eff:
+        got["reasoning_effort"] = eff
     return got
 
 
@@ -611,8 +621,22 @@ def decide(img: Image.Image, goal: str, extra: str = "", page: str = "",
         {"role": "user", "content": parts},
     ]
 
-    reply = _chat(messages)
-    decision = _parse(reply)
+    # 解析失败就再要一次：模型偶发会写坏 JSON（实测见过 action 里漏掉 "type"、
+    # 返回开头粘了历史里的时间戳等），一次重试通常就好。_chat 只负责网络/模型
+    # 层的重试，**解析层不归它管**——不在这里重试的话，解析失败会直接掐断回合。
+    last_exc: Optional[BrainError] = None
+    decision: Optional[Decision] = None
+    for attempt in range(3):
+        reply = _chat(messages)
+        try:
+            decision = _parse(reply)
+            break
+        except BrainError as exc:
+            last_exc = exc
+            _log.warning("返回解析失败（第 %d 次），重新要一次：%s",
+                         attempt + 1, exc)
+    if decision is None:
+        raise last_exc if last_exc is not None else BrainError("解析失败")
 
     # 记进历史。两条注意：
     #
@@ -772,6 +796,7 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
     if effort:
         kwargs["reasoning_effort"] = effort
     downgrades = 0            # 因为"思考吃光额度"降了几次档
+    empty_retries = 0         # 因为"返回空正文"原样重试了几次
 
     # 逐步降档的顺序。**要跳着降**：max/ultra/xhigh 是相邻的"极高"档，
     # 实测 max->ultra 思考量几乎没变（25794 字 vs 25855 字），白白多花一次请求
@@ -794,7 +819,12 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
             _log.error("调用模型失败：%s", exc)
             raise BrainError(msg) from exc
 
-        # 调用成功了，但要看正文是不是空的（思考吃光额度的典型症状）
+        # 调用成功了，但正文可能是空的。**两种情况分开处理**：
+        #   a) finish_reason=length：思考把 max_tokens 吃光了 -> 降一档重试（见下）
+        #   b) 其它 finish_reason（实测 stop 时正文是 35 个空格）：
+        #      网关/模型的偶发空返回 -> 原样重试一两次通常就好。
+        # 早先 b 这种情况直接 return，_parse 必然失败、整个回合被掐断——
+        # 实测一天撞了 4 次（15:03、15:06、15:46、15:53…），每次都得人工点继续。
         try:
             ch = resp.choices[0]
             content = (ch.message.content or "").strip()
@@ -802,18 +832,27 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
         except Exception:
             _log_raw(resp)
             return resp
-        if content or not think:
+        if content:
             _log_raw(resp)
             return resp
-        if getattr(ch, "finish_reason", "") != "length":
+
+        finish = getattr(ch, "finish_reason", "")
+        if finish != "length":
+            empty_retries += 1
             _log_raw(resp)
+            if empty_retries <= 2:
+                _log.warning("模型返回了空正文（finish_reason=%s），原样重试第 %d 次",
+                             finish, empty_retries)
+                continue
+            _log.error("连续 %d 次返回空正文，放弃", empty_retries)
             return resp
 
         # 思考吃光了额度 -> 降档重试。
         # **先把这次思考的内容存下来**：看不到它在想什么，就只能瞎猜
         # （实测踩过：只知道"思考了 25794 字"，完全不知道它是在解物理题
         #  还是在原地打转，没法判断该加额度还是该降档）。
-        _dump_long_think(think, attempt + 1)
+        if think:
+            _dump_long_think(think, attempt + 1)
         cur = str(kwargs.get("reasoning_effort") or "").lower()
         lower = SKIP.get(cur)
         if lower is None and cur in LADDER:
@@ -1003,6 +1042,58 @@ def _dump_bad_reply(content: str) -> None:
         pass
 
 
+# action 里漏写 "type" 时，按"键名就是动作名"来修（实测见过：
+# {"click": 603, "y": 510} —— 键名写了 click，但没给 "type": "click"）。
+# 各动作的"主参数"：值是个数/字符串时塞进这个字段。
+_PRIMARY_PARAM = {
+    "click": "x", "scroll": "notches", "wait": "seconds",
+    "drag": "x1", "press": "key", "type": "text",
+    "finish": "reason", "reply": "text", "ask_human": "question",
+}
+# 修完之后必须有的字段（缺了就当没修，交给上层重试，别瞎猜）
+_MIN_KEYS = {
+    "click": (("x", "y"), ("target",)),
+    "scroll": (("notches",),),
+    "drag": (("x1", "y1", "x2", "y2"),),
+    "type": (("text",),),
+    "press": (("key",),),
+    "reply": (("text",),),
+}
+
+
+def _repair_action(action: Dict[str, Any]) -> Dict[str, Any]:
+    """给漏写 "type" 的 action 补一个（**只在形态明确时**修）。
+
+    实测模型偶尔把动作写成 `{"click": 603, "y": 510}`：键名是动作名，但没写
+    `"type": "click"`。这种一眼能看出来，补上键名、其余键原样保留即可。
+    拿不准（有多个动作名键、或补完缺必填字段）就原样返回，交给上层重试。
+    """
+    if not isinstance(action, dict) or "type" in action:
+        return action
+    names = [k for k in action.keys() if k in ACTIONS]
+    if len(names) != 1:
+        return action
+    name = names[0]
+    val = action[name]
+    out: Dict[str, Any] = {"type": name}
+    if isinstance(val, dict):
+        out.update(val)
+    elif isinstance(val, (int, float)) and not isinstance(val, bool):
+        param = _PRIMARY_PARAM.get(name)
+        if param:
+            out[param] = val
+    elif isinstance(val, str):
+        param = _PRIMARY_PARAM.get(name)
+        if param:
+            out[param] = val
+    out.update({k: v for k, v in action.items() if k != name})
+
+    for required in _MIN_KEYS.get(name, ((),)):
+        if all(k in out for k in required):
+            return out
+    return action
+
+
 def _parse(resp) -> Decision:
     """从响应里抠出 JSON。模型爱加代码块或前言，这里做容错。"""
     try:
@@ -1017,15 +1108,25 @@ def _parse(resp) -> Decision:
         # 不把这点说清楚的话，界面上只有一句"返回的不是合法 JSON"，完全看不出方向。
         if not content.strip():
             raise BrainError(
-                "模型这次只输出了思考、没输出正文（思考把 max_tokens 用光了）。"
-                "解决办法：调大 brain.init(max_tokens=...)，"
-                "或把 reasoning_effort 降到 medium/high")
+                "模型这次只返回了空正文（程序已自动原样重试过，还是空）。"
+                "常见原因：网关偶发空返回，或思考把 max_tokens 吃光。"
+                "先点「继续」接着跑通常就能恢复；频繁出现时调大 "
+                "brain.init(max_tokens=...) 或降低 reasoning_effort")
         raise BrainError(f"模型返回的不是合法 JSON：{content[:200]}")
 
     action = obj.get("action") or {}
+    # 模型偶尔漏写 "type"（把动作名当键写在 action 里）：能认出来就自动修，
+    # 修不了再抛给上层重试。
+    if isinstance(action, dict) and "type" not in action:
+        repaired = _repair_action(action)
+        if "type" in repaired:
+            _log.warning("action 里没写 type，按形态自动修复：%r -> %r",
+                         action, repaired)
+            action = repaired
     if not isinstance(action, dict) or "type" not in action:
         _dump_bad_reply(content)
-        raise BrainError(f"返回里没有 action：{obj}")
+        raise BrainError(
+            f"返回里的 action 没法用（既没有 type，也不是能认出来的动作键名）：{obj}")
 
     atype = str(action["type"]).strip().lower()
     if atype not in ACTIONS:

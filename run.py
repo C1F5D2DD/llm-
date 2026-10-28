@@ -76,6 +76,7 @@ RIGHT_MIN_W = 420        # 右栏（对话区）的最小宽度，免得被左�
 # 一条消息可能折好几行，只数条数兜不住。
 # 另外控件越多每次追加越慢，所以这个值也不能给太大。
 CHAT_MAX_PX = 20000
+CHAT_KEEP_MIN = 10        # 裁剪时至少留这么多条，防止"算错高度→把对话删光"
 
 # 流式"活气泡"的参数（只针对长输出时的实时思考）。
 # **必须限高**：早先每 150ms 把最近 3000 字整段 configure 给一个 CTkLabel，
@@ -414,13 +415,27 @@ class Viewer(ctk.CTk):
 
         不丢的话会一路堆到 tkinter 的坐标上限（约 32767px），之后的消息
         画不出来，整个对话区看着是空的（实测踩过）。
+
+        **不能只信 _chat_h 这个累加值**：窗口宽度一变，每条消息的高度全变，
+        累加值就失真了；失真后还按"超限"去删，会把消息删过头——实测拖一下
+        窗口，对话区直接被删空。所以真要裁时，先让布局把新折行落实、按实际
+        高度重算一遍再删，并且至少留 CHAT_KEEP_MIN 条。
         """
         kids = self.chat.winfo_children()
-        while len(kids) > 1 and self._chat_h > CHAT_MAX_PX:
+        if not kids:
+            self._chat_h = 0
+            return
+        if self._chat_h <= CHAT_MAX_PX:
+            return
+        self.update_idletasks()
+        kids = self.chat.winfo_children()
+        self._chat_h = sum(max(0, w.winfo_reqheight()) for w in kids)
+        while len(kids) > CHAT_KEEP_MIN and self._chat_h > CHAT_MAX_PX:
             oldest = kids[0]
             self._chat_h -= max(0, oldest.winfo_reqheight())
             oldest.destroy()
             kids = self.chat.winfo_children()
+        self._chat_h = sum(max(0, w.winfo_reqheight()) for w in kids)
 
     def _on_chat_resize(self, _event=None) -> None:
         """对话区尺寸变了就重新折行。
@@ -436,6 +451,13 @@ class Viewer(ctk.CTk):
             self._wrap_pending = False
             if self._closing:
                 return
+            # 最小化/刚映射时对话区宽度可能只有 1px：这时重算折行和裁剪
+            # 毫无意义，反而会把每条消息都算成"几百行高"、把消息删光（实测）。
+            try:
+                if self.chat.winfo_width() <= 80:
+                    return
+            except Exception:
+                return
             wrap = self._chat_wrap()
             if wrap == self._wrap_cur:
                 return
@@ -449,9 +471,13 @@ class Viewer(ctk.CTk):
                     lbl.configure(wraplength=wrap)
                 except Exception:
                     pass
-            # 折行变了，每条的高度也跟着变，重新累计并裁掉超出的
+            # 折行变了，每条的高度也跟着变：**先让布局算完再量**，否则量到的
+            # 是旧高度，_chat_h 会失真，接下来的裁剪就会删过头。
+            self.update_idletasks()
+            kids = self.chat.winfo_children()
             self._chat_h = sum(max(0, w.winfo_reqheight()) for w in kids)
             self._chat_trim()
+            self._scroll_bottom()
 
         self.after(120, do)
 
@@ -494,7 +520,12 @@ class Viewer(ctk.CTk):
             if self._closing:
                 return
             try:
-                self.chat._parent_canvas.yview_moveto(1.0)
+                canvas = self.chat._parent_canvas
+                # **先按实际内容刷新 scrollregion**：消息被裁掉/重折行之后，
+                # canvas 的 scrollregion 可能还是旧高度；此时 yview_moveto(1.0)
+                # 会把视口停到"内容下方"的空白里——看起来就是对话区全空（实测）。
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                canvas.yview_moveto(1.0)
             except Exception:
                 pass
         self.after(50, do)

@@ -43,6 +43,10 @@ MAX_STEPS = 50         # 一个回合最多跑多少步，防止模型停不下�
 MAX_WAIT = 600.0        # 单次 wait 的上限（秒）。看视频要等很久，这个得放得够大；
                         # 提示词里告诉模型的数字要和这里一致，否则它按 600 规划、程序只等 30
 WAIT_SLICE = 0.2         # wait 分片检查停止信号的间隔
+AUTO_RESUME_AFTER = 300.0  # ask_human 之后多久自动重试一次（秒）
+AUTO_RESUME_MAX = 3      # 连续自动重试上限，超了就老实等人
+NO_PROGRESS_WARN = 12    # 连续这么多步看不到任何状态变化 -> 提醒模型换做法
+NO_PROGRESS_STOP = 30    # 提醒过还不变 -> 判定卡死，停下整个回合
 
 # 思考强度候选。**服务端认这些值**——传别的会被 422 拒绝，
 # 错误信息里会把合法值列出来（实测拿非法值试探出来的）。
@@ -224,6 +228,19 @@ class Viewer(ctk.CTk):
         self._chat_h = 0            # 对话区已占高度（px），超 CHAT_MAX_PX 就丢老的
         self._wrap_cur = 0          # 当前用的折行宽度，跟新算出来的一样就不折腾
         self._wrap_pending = False  # 已排了一个重新折行的回调
+        self._wrap_px = 0           # 上次重折行时的原始宽度（差几像素就不折腾）
+        # 页面跑偏保护：记住最后一个"学习页"地址，跑偏时自动切回去
+        self._last_study_url = ""
+        self._guard_note = ""       # 本步带给模型的一句提醒（页面跑偏处理等）
+        # ask_human 之后的自动重试
+        self._auto_token = 0        # 令牌：用户一说话就作废挂着的自动重试
+        self._auto_resumes = 0      # 连续自动重试次数
+        self._auto_firing = False   # 正在执行"自动重试"（这时 on_send 不算用户发言）
+        # "连续多少步没有任何状态变化"看门狗
+        self._no_progress = 0
+        self._last_facts_changed = True
+        # 预览：上一帧对象（同一帧就不重复 resize+paste）
+        self._last_frame_obj = None
         # 流式显示：模型的思考/正文逐片到达，往一条"活气泡"里**只追加**，
         # 同时把看不见的头部裁掉（气泡是 tk.Text，原因见 STREAM_MAX_LINES 上面）。
         self._stream_text = None    # 当前那条活气泡（None 表示还没开）
@@ -454,10 +471,16 @@ class Viewer(ctk.CTk):
             # 最小化/刚映射时对话区宽度可能只有 1px：这时重算折行和裁剪
             # 毫无意义，反而会把每条消息都算成"几百行高"、把消息删光（实测）。
             try:
-                if self.chat.winfo_width() <= 80:
-                    return
+                raw_w = self.chat.winfo_width()
             except Exception:
+                raw_w = 0
+            # 最小化/刚映射时宽度可能是 1px：这时重算折行和裁剪毫无意义
+            if raw_w <= 80:
                 return
+            # 宽度只差几个像素（拖动窗口的中间态）不值得给几百条消息重折行
+            if abs(raw_w - self._wrap_px) < 6:
+                return
+            self._wrap_px = raw_w
             wrap = self._chat_wrap()
             if wrap == self._wrap_cur:
                 return
@@ -479,7 +502,7 @@ class Viewer(ctk.CTk):
             self._chat_trim()
             self._scroll_bottom()
 
-        self.after(120, do)
+        self.after(250, do)
 
     def _say(self, kind: str, text: str) -> None:
         """往对话区追加一条（带时间戳）。必须在主线程调用。
@@ -781,6 +804,12 @@ class Viewer(ctk.CTk):
             return
         self.msg.set("")
         self._say("you", text)
+        # 用户开口了：取消可能挂着的"ask_human 自动重试"。
+        # 注意：自动重试自己也会走 on_send，那种情况不能把重试计数清零
+        # （否则 AUTO_RESUME_MAX 永远到不了，会无限自动重试）。
+        self._auto_token += 1
+        if not self._auto_firing:
+            self._auto_resumes = 0
 
         if self._running:
             self._inbox.put(text)
@@ -805,6 +834,7 @@ class Viewer(ctk.CTk):
         """停止当前回合。正在进行的网络请求没法打断，但它返回后不再执行动作。"""
         if not self._running:
             return
+        self._auto_token += 1        # 手动停了就别自动重试了
         self._stop_evt.set()
         self._say("note", "正在停止…")
         self.stop_btn.configure(text="停止中", state="disabled")
@@ -861,6 +891,10 @@ class Viewer(ctk.CTk):
                                      f"（可以在左边改「最大轮数」再继续）")
                     break
 
+                # 每步开始前先把"页面跑偏"处理掉（模型误点会跳到别的网站/
+                # 误开新标签页，实测两次卡在「超星智能体」页）
+                self._guard_page()
+
                 img = capture.get_frame()
                 extra = self._drain_inbox()
                 # 画面是不是冻住了。这个事实**必须告诉模型**：截图冻住时，
@@ -890,6 +924,10 @@ class Viewer(ctk.CTk):
                 video = wc.video_info()
                 if video:
                     page = f"{page}；{video}" if page else video
+                if self._guard_note:
+                    # 页面跑偏被自动纠正：必须告诉模型，否则它按旧截图做判断
+                    page = f"{self._guard_note}；{page}" if page else self._guard_note
+                    self._guard_note = ""
 
                 d = brain.decide(img, goal, extra=extra, page=page, frame_age=stale)
                 # 这一步想完了，把"模型输出中"那条活气泡收尾
@@ -909,6 +947,9 @@ class Viewer(ctk.CTk):
                     break
                 if t == "ask_human":
                     self._ui("ask", d.action.get("question", "需要你处理"))
+                    # 以前求完助就死等人工（实测两次，第二次空了 2 小时）。
+                    # 现在安排一次 5 分钟后的自动重试；用户一说话就取消。
+                    self._schedule_auto_resume()
                     break
                 if self._stop_evt.is_set():
                     self._ui("done", "已停止（这一步没执行）")
@@ -935,6 +976,7 @@ class Viewer(ctk.CTk):
                         self._ui("note", f"这个动作已经做了 {n} 次，开始每步提醒模型")
 
                 result = self._exec(d.action)
+                changed = self._last_facts_changed
                 self._ui("ok", result)
                 # 每步都把这件事实附在结果里。模型自己数不清重复了几次
                 # （它的想法每次都写着"改为点那一行文字"，以为在换办法，
@@ -948,6 +990,27 @@ class Viewer(ctk.CTk):
                                "在程序看来就是同一个动作。"
                                "反复做同一个动作没用时就该换个坐标、"
                                "换滚动区域、或 reload）" % n)
+                # ---- 连续无进展看门狗 ----
+                # 重复动作熔断只看"完全相同的动作"，但模型可能每一步都换个坐标、
+                # 却全都没效果（实测 3.3 测验的 D 选项换着坐标点了 8 次）。
+                # 这里用"程序观察到的事实有没有任何变化"来判断。
+                if t != "wait":
+                    if changed:
+                        self._no_progress = 0
+                    else:
+                        self._no_progress += 1
+                        if self._no_progress == NO_PROGRESS_WARN:
+                            result += ("\n（程序提醒：最近 %d 步没有观察到任何状态变化"
+                                       "（地址/滚动/勾选/弹窗都没变）。换个做法："
+                                       "换滚动区域、reload、或 ask_human）"
+                                       % self._no_progress)
+                        elif self._no_progress >= NO_PROGRESS_STOP:
+                            self._ui("err", f"连续 {self._no_progress} 步没有任何状态变化，"
+                                            "判定卡死，先停下")
+                            self._ui("note", "可以：换个说法重新下达目标、点「清空」重来，"
+                                             "或者自己看一眼页面卡在哪")
+                            brain.note_result(result)
+                            break
                 # 关键：把执行结果告诉模型，否则它看不见效果，会一直重复同一个动作
                 brain.note_result(result)
                 self._step += 1
@@ -958,6 +1021,70 @@ class Viewer(ctk.CTk):
             brain.set_stream_handler(None)      # 关掉流式回调，别让它往已结束的回合里贴字
             self.after(0, self._stream_flush)
             self.after(0, lambda: self._set_buttons(busy=False))
+
+    def _guard_page(self) -> None:
+        """每步开始前把"页面跑偏"处理掉（在工作线程里调用）。
+
+        模型误点会跳到别的网站、或误开「超星智能体」之类的新标签页（实测两次
+        卡在那里，第二次停了近 2 小时才被发现）。规则：
+        - 学习页（URL 含 studentstudy）→ 记住地址；
+        - 学习通内部页面之间跳转 → 不干预（可能正是模型要去的页）；
+        - 已知的"误点陷阱页"（超星智能体 / 学校站点）或跳到别的网站
+          → 自动导航回记住的学习页，并给模型留一句说明。
+        """
+        try:
+            state = wc.page_state()
+            if not state:
+                return
+            d = json.loads(state)
+            url = str(d.get("u") or "")
+        except Exception:
+            return
+        if "studentstudy" in url:
+            self._last_study_url = url
+            return
+        if not self._last_study_url:
+            return
+        # 这些是实测踩过的坑：误点会开到超星智能体/学校站点，然后在那边迷路。
+        trap = ("robot.chaoxing.com", "42.62.3.119", "/School/")
+        if "chaoxing.com" in url and not any(t in url for t in trap):
+            return          # 正常的学习通页面，不干预
+        try:
+            wc.navigate(self._last_study_url)
+            self._guard_note = (f"（程序提醒：当前页面跑偏到了 {url[:60]}，"
+                                f"已经自动切回学习页，请只在学习页上操作）")
+            self._ui("note", "页面跑偏，已自动切回学习页")
+        except Exception as exc:
+            self._guard_note = f"（程序提醒：页面跑偏，自动切回失败：{exc}）"
+
+    def _schedule_auto_resume(self) -> None:
+        """ask_human 之后安排一次自动重试（在工作线程里调用）。
+
+        以前求助完就死等人工（实测两次，第二次空了 2 小时）。现在 5 分钟后
+        自动发一句「继续」试一次；用户提前发消息会取消。连续自动重试最多
+        AUTO_RESUME_MAX 次，再不行就老实等人。
+        """
+        if self._auto_resumes >= AUTO_RESUME_MAX:
+            self._ui("note", f"已自动重试 {AUTO_RESUME_MAX} 次仍未恢复，等你处理"
+                             f"（处理完在对话区说句话即可）")
+            return
+        self._auto_token += 1
+        token = self._auto_token
+        self._ui("note", f"{int(AUTO_RESUME_AFTER / 60)} 分钟后自动重试一次"
+                         f"（你发消息会取消它）")
+
+        def fire():
+            if token != self._auto_token or self._running or self._closing:
+                return
+            self._auto_resumes += 1
+            self._auto_firing = True
+            try:
+                self.msg.set("（自动重试）继续完成刚才的任务")
+                self.on_send()
+            finally:
+                self._auto_firing = False
+
+        self.after(int(AUTO_RESUME_AFTER * 1000), fire)
 
     def _drain_inbox(self) -> str:
         """取走运行期间插入的对话，拼成一行给模型。"""
@@ -977,6 +1104,7 @@ class Viewer(ctk.CTk):
         模型看不见效果就一直重复同一个坐标（实测死循环到步数上限）。
         """
         t = action.get("type")
+        self._last_facts_changed = True
         try:
             if t in ("click", "scroll", "drag", "type", "press"):
                 before = wc.page_state()
@@ -999,11 +1127,28 @@ class Viewer(ctk.CTk):
                             label = str(el.get("t") or el.get("tag") or "")
                             desc0 = f"点击 {idx} 号「{label[:20]}」"
                         except (ValueError, TypeError, IndexError, KeyError):
-                            return (f"（编号 {tgt} 不存在——请重新看图上的红框编号，"
-                                    f"用 target 填那个编号）")
+                            self._last_facts_changed = False
+                            return (f"（编号 {tgt} 不存在——当前屏只有 "
+                                    f"{len(self._elements)} 个编号；"
+                                    f"**编号只对当前屏有效，上一屏的编号不能用**，"
+                                    f"请重新看当前屏的红框编号再选）")
+                        # 点击前查一下这一点实际会点到谁：被弹窗/浮层/固定头
+                        # 挡住时能立刻发现（实测很多"点了没反应"就是点到了别处）
+                        hit = wc.element_at(cx, cy)
+                        if hit:
+                            axx = str(hit.get("axx") or "")
+                            if not axx:
+                                desc0 += (f"（注意：这个位置实际是 {hit.get('tag')}，"
+                                          f"没落在编号元素上，可能被浮层挡住）")
+                            elif axx != str(idx):
+                                desc0 += (f"（注意：这个位置实际是 {axx} 号元素，"
+                                          f"可能被浮层挡住或编号看错了）")
                     else:
                         cx, cy = int(action["x"]), int(action["y"])
                         desc0 = f"已点击 ({cx}, {cy})"
+                        hit = wc.element_at(cx, cy)
+                        if hit and hit.get("axx"):
+                            desc0 += f"（坐标落在 {hit['axx']} 号元素上）"
                     wc.click(cx, cy, settle=0.6)
                     desc = desc0
                     clicked_at = (cx, cy)
@@ -1032,12 +1177,12 @@ class Viewer(ctk.CTk):
                     wc.press_key(key)
                     desc = f"已按键 {key}"
                 out = desc + self._facts(before)
-                # 点了但页面没变 -> 提醒模型"看看图上的编号，换个号重试"。
+                # 点了但没观察到变化 -> 提醒模型换个编号/做法。
                 # **不在这里附元素文字**：那些文字是从 DOM 爬的，学习通有字体加密
                 # （DOM 里是生僻字、靠字体画成正确的字），爬来的就是错的，
                 # 喂过去只会把模型带偏。模型看着图上的红框编号重选即可。
-                if clicked_at and "没有" in out:
-                    out += ("\n（这次点击没引起变化。如果点偏了，看着图上那个位置"
+                if clicked_at and not self._last_facts_changed:
+                    out += ("\n（这次点击没引起任何可观测变化。如果点偏了，看着图上那个位置"
                             "附近有哪个红框编号，换个编号重试。）")
                 return out
 
@@ -1046,38 +1191,75 @@ class Viewer(ctk.CTk):
             if t == "reload":
                 before = wc.page_state()
                 wc.reload_page()
-                return "已刷新页面" + self._facts(before)
+                out = "已刷新页面" + self._facts(before)
+                self._last_facts_changed = True   # 刷新算一次主动重置，别触发卡死判定
+                return out
+            self._last_facts_changed = False
             return f"（{t} 没执行）"
         except Exception as exc:
+            self._last_facts_changed = False
             return f"执行失败：{exc}"
 
     def _facts(self, before: str) -> str:
         """把动作前后的原始数据附在结果里。
 
         **只报事实，不下"变没变"的结论**。判断是模型的事——它会拿到动作前后
-        两张截图自己比。程序的数只有地址/标题/滚动/标签页数四项，页面内部滚动、
-        弹窗浮现、按钮变灰这类变化一概看不出来，硬下结论只会误导模型
+        两张截图自己比。程序的数据包括：地址、标题、滚动、标签页数，以及新增的
+        已勾选数、选中态数、可见弹窗数、内部滚动总位置。
+        后四项专治「选答案/切标签/开关弹窗」这类不改地址的动作——以前它们
+        全被报成「没有变化」，模型就反复点（实测 3.3 测验同一个选项点了 8 次）。
         （实测：把页面内部滚动误报成"没有任何变化"，模型就反复重试同一个动作，
         而它重试的动作其实每次都成功了）。
         """
         after = wc.page_state()
+        self._last_facts_changed = False
         if not (before and after):
+            self._last_facts_changed = True
             return ""
         try:
             old, new = json.loads(before), json.loads(after)
         except ValueError:
+            self._last_facts_changed = True
             return ""
+
+        def num(d, key, default=None):
+            if not isinstance(d, dict) or key not in d:
+                return default
+            try:
+                return int(d.get(key))
+            except (TypeError, ValueError):
+                return default
+
         out = []
+        changed = False
         if old.get("u") != new.get("u"):
             out.append(f"地址变了 -> {str(new.get('u'))[:80]}")
+            changed = True
         if old.get("t") != new.get("t"):
             out.append(f"标题变了 -> {str(new.get('t'))[:40]}")
-        a, b = int(old.get("tabs", -1)), int(new.get("tabs", -1))
+            changed = True
+        a, b = num(old, "tabs", -1), num(new, "tabs", -1)
         if a >= 0 and b > a:
             out.append(f"新开了 {b - a} 个标签页")
-        dy = int(new.get("y", 0)) - int(old.get("y", 0))
+            changed = True
+        dy = num(new, "y", 0) - num(old, "y", 0)
         if abs(dy) > 2:
             out.append(f"页面滚了 {dy:+d}px（现在 {new.get('y')}px）")
+            changed = True
+        # ---- 结构化状态（专门覆盖"不改地址"的动作）----
+        for key, label in (("checked", "已勾选"), ("sel", "选中态"),
+                           ("dlg", "可见弹窗")):
+            o, n2 = num(old, key), num(new, key)
+            if o is None or n2 is None or o == n2:
+                continue
+            changed = True
+            out.append(f"{label} {o} -> {n2}")
+        o, n2 = num(old, "itop"), num(new, "itop")
+        if o is not None and n2 is not None and o != n2:
+            changed = True
+            out.append(f"内部滚动 {n2 - o:+d}px")
+
+        self._last_facts_changed = changed
         if not out:
             return "（数据上没什么变化，但**以你看到的两张图为准**）"
         return "（数据参考：" + "；".join(out) + "——**以你看到的两张图为准**）"
@@ -1122,6 +1304,19 @@ class Viewer(ctk.CTk):
                 self.after(REFRESH_MS, self.refresh)
                 return
             img = capture.get_frame()
+            # 抓帧线程 250ms 才换一帧，而界面 150ms 刷一次——同一帧对象直接跳过，
+            # 省掉约 40% 的 resize+paste（每帧约 10ms）。
+            if img is self._last_frame_obj:
+                self.after(REFRESH_MS, self.refresh)
+                return
+            self._last_frame_obj = img
+            # 窗口最小化时不缩放/贴图：看不见还烧 CPU（挂机时很常见）
+            try:
+                if self.state() == "iconic":
+                    self.after(REFRESH_MS, self.refresh)
+                    return
+            except Exception:
+                pass
             w, h = img.size
 
             # 单位要小心：winfo_* 返回**物理像素**，而 CTkImage 的 size 是**逻辑像素**
@@ -1163,9 +1358,11 @@ class Viewer(ctk.CTk):
             if self._photo is None or self._photo_size != phys:
                 self._photo = ImageTk.PhotoImage(_PilImage.new("RGB", phys))
                 self._photo_size = phys
-                self.screen.configure(image=self._photo, text="")
+                # 尺寸只在重建时设一次；每帧都 configure(width/height) 会白白触发
+                # 一次布局计算（实测每帧多花 0.2ms 且可能引起重绘）。
+                self.screen.configure(image=self._photo, text="",
+                                      width=dw, height=dh)
             self._photo.paste(img.resize(phys, Image_BILINEAR))
-            self.screen.configure(width=dw, height=dh)
         except Exception as exc:
             self._err += 1
             if self._err <= 3:

@@ -27,8 +27,8 @@ from ctypes import wintypes
 from typing import Optional
 
 __all__ = ["init", "find_hwnd", "click", "drag", "scroll",
-           "type_text", "press_key", "reload_page",
-           "page_state", "page_info", "video_info",
+           "type_text", "press_key", "reload_page", "element_at", "navigate",
+           "page_state", "page_info", "video_info", "list_pages",
            "move_out", "move_in", "resize", "WindowError"]
 
 DEFAULT_PORT = 9222     # Edge 的调试端口，和 run.py 里启动时用的一致
@@ -63,11 +63,9 @@ OFFSCREEN_Y = 0
 WINDOW_CLASS = "Chrome_WidgetWin_1"
 _SCROLL_STEP = 100      # 一"格"滚多少像素
 
-# 页面指纹：地址 + 标题 + 滚动位置。**必须带上滚动位置**——只比地址和标题的话，
-# 滚动这个动作永远被判成"页面没变化"，模型会以为滚动没用、退回去重复点击同一个坐标
-# （实测死循环到步数上限）。
-_PAGE_STATE_JS = ("JSON.stringify({u: location.href, t: document.title, "
-                  "y: Math.round(window.scrollY)})")
+# 页面状态指纹的旧版本（只比地址/标题/滚动）已经删掉——它看不见"选答案、切标签、
+# 开关弹窗"这类不改地址的动作，导致所有这些动作都被报成"页面没变化"，模型反复点
+# （实测 3.3 测验同一个选项被点了 8 次）。现在统一用 _PAGE_JS 里的结构化状态。
 
 # 视频的真实播放状态，**递归钻同源 iframe**。
 # 为什么必须由程序来读、不能靠模型看图：播放器正中那个圆钮，播放时是"暂停"图标、
@@ -135,7 +133,8 @@ _PAGE_JS = """(() => {
     const x0 = Math.max(0, r.left), x1 = Math.min(VW, r.right);
     const y0 = Math.max(0, r.top), y1 = Math.min(VH, r.bottom);
     if (x1 - x0 < 120 || y1 - y0 < 120) continue;         // 露出来太少，滚了也不准
-    inners.push({left: left, x: Math.round((x0 + x1) / 2), y: Math.round((y0 + y1) / 2)});
+    inners.push({left: left, top: Math.round(el.scrollTop),
+                 x: Math.round((x0 + x1) / 2), y: Math.round((y0 + y1) / 2)});
   }
   inners.sort((a, b) => b.left - a.left);
   const keep = [];                                        // 同一块区域会被内外层重复报，去重
@@ -143,8 +142,77 @@ _PAGE_JS = """(() => {
     if (!keep.some(k => Math.abs(k.x - it.x) < 60 && Math.abs(k.y - it.y) < 60)) keep.push(it);
     if (keep.length >= 3) break;
   }
-  return JSON.stringify({h: h, vw: VW, vh: VH, y: Math.round(window.scrollY),
-                         inners: keep, iframes: iframes});
+  let itop = 0;
+  for (const k of keep) itop += (k.top || 0);
+
+  // 结构化状态（**不读页面文字**，所以不受学习通字体加密影响）：
+  //   已勾选 input 数 / 带选中样式的元素数 / 可见弹窗数 / 内部滚动总量。
+  // 这四项是"动作生没生效"的直接证据——选答案、切标签、开关弹窗都不改地址，
+  // 以前只比地址/滚动/标题，结果全被报成"没有变化"，模型就反复点（实测踩过）。
+  const countSel = (sel) => {
+    try { return document.querySelectorAll(sel).length; } catch (e) { return -1; }
+  };
+  let dlg = 0;
+  try {
+    const seen = new Set();
+    const sels = ['[role="dialog"]', '.layui-layer', '.el-dialog', '.ant-modal',
+                  '[class*="dialog"]', '[class*="modal"]', '[class*="popup"]'];
+    for (const sel of sels) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+        const cs = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        if (parseFloat(cs.opacity || '1') < 0.05) continue;
+        if (r.width < 60 || r.height < 40) continue;      // 去掉埋点/装饰用的小浮层
+        dlg++;
+      }
+    }
+  } catch (e) {}
+  const checked = countSel('input:checked');
+  const selCount = countSel('[aria-checked="true"],[aria-selected="true"],'
+                            + '[class*="selected"],[class*="checked"]');
+
+  return JSON.stringify({u: location.href, t: document.title,
+                         h: h, vw: VW, vh: VH, y: Math.round(window.scrollY),
+                         inners: keep, iframes: iframes, itop: itop,
+                         checked: checked, sel: selCount, dlg: dlg});
+})()"""
+
+
+# 查 (x, y) 这个点最上层是什么元素。页面枚举（pageCapture）会给可点元素打上
+# data-axx-id 属性，这里沿父链找它——用来判断"这一下到底点在谁身上"。
+# 实测误点很多：弹窗/浮层/固定头挡住目标时点下去毫无反应，但模型看不见原因。
+_ELEMENT_AT_JS = """(() => {
+  function probe(doc, x, y) {
+    try {
+      const el = doc.elementFromPoint(x, y);
+      if (!el) return null;
+      // 点在 iframe 上：钻进同源 iframe 里再查（学习通的播放器控件都在 iframe 里，
+      // 只查主文档的话永远只能看到那个 IFRAME 壳，会误报"没落在编号元素上"）
+      if (el.tagName === 'IFRAME') {
+        let inner = null;
+        try { inner = el.contentDocument; } catch (e) { inner = null; }
+        if (inner) {
+          const r = el.getBoundingClientRect();
+          const sub = probe(inner, x - r.left, y - r.top);
+          if (sub) return sub;
+        }
+      }
+      let e = el, axx = '';
+      while (e) {
+        const v = e.getAttribute && e.getAttribute('data-axx-id');
+        if (v) { axx = v; break; }
+        e = e.parentElement;
+      }
+      return {tag: el.tagName,
+              cls: String(el.className || '').slice(0, 40),
+              axx: axx};
+    } catch (err) { return null; }
+  }
+  const got = probe(document, %d, %d);
+  return got ? JSON.stringify(got) : '';
 })()"""
 
 
@@ -276,13 +344,15 @@ class _CDP:
         self._ws_url = None     # 当前连着的页面，换了要重连
 
     def _target(self) -> dict:
-        """取当前活跃的标签页。
+        """取要操作的标签页。
 
-        每次调用都重新查——用户会手动切标签页，如果锁死第一次选的那个，
-        后续操作就会一直作用在旧页面上（实测踩过：切了标签页后滚动还是滚旧的）。
+        每次调用都重新查——用户会手动切标签页，锁死第一次选的那个就会一直
+        操作旧页（实测踩过：切了标签页后滚动还是滚旧的）。
 
-        挑页规则：跳过 edge://newtab 这类内部页（在上面执行 JS 会失败），
-        优先 http/https，多个时取排在最前的（Edge 把活跃标签排前面）。
+        **挑页规则（重要）**：优先「学习页」（URL 含 studentstudy），其次其它
+        学习通页面，最后才是任意 http 页。因为模型会误点开「超星智能体」之类的
+        新标签页，这些页面常常排在最前面；按"第一个 http 页"取就会一直对着
+        错误页面截图/点击（实测两次卡死在这里，第二次停了近 2 小时）。
         """
         try:
             with urllib.request.urlopen(
@@ -295,7 +365,19 @@ class _CDP:
 
         real = [p for p in pages
                 if (p.get("url") or "").startswith(("http://", "https://"))]
-        return real[0] if real else pages[0]
+        if not real:
+            return pages[0]
+
+        def rank(p: dict) -> int:
+            u = (p.get("url") or "").lower()
+            if "studentstudy" in u:
+                return 0
+            if "chaoxing.com" in u:
+                return 1
+            return 2
+
+        real.sort(key=rank)
+        return real[0]
 
     def call(self, method: str, params: Optional[dict] = None, timeout: float = 15.0) -> dict:
         from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -444,6 +526,26 @@ def click(x: int, y: int, settle: float = 0.4) -> None:
     _mouse("mouseReleased", x, y, button="left", clicks=1)
     if settle:
         time.sleep(settle)
+
+
+def element_at(x: int, y: int) -> dict:
+    """(x, y) 这个点最上层是什么元素。返回 {tag, cls, axx}，查不到返回 {}。
+
+    axx 是 pageCapture 枚举可点元素时打上的编号（data-axx-id）。点击前查一下，
+    就能判断"这一下到底点在谁身上"：被弹窗、浮层、固定头挡住时一目了然，
+    不用让模型自己猜"为什么没反应"（实测经常点在弹窗后面的元素上）。
+    """
+    try:
+        raw = _require().eval(_ELEMENT_AT_JS % (int(x), int(y)))
+    except Exception:
+        return {}
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def drag(x1: int, y1: int, x2: int, y2: int, steps: int = 10,
@@ -649,20 +751,31 @@ def reload_page(settle: float = 2.0) -> None:
         time.sleep(settle)
 
 
+def navigate(url: str, settle: float = 1.5) -> None:
+    """把当前标签页跳到指定地址（用于"页面跑偏后切回学习页"）。"""
+    cdp = _require()
+    cdp.call("Page.navigate", {"url": str(url)}, timeout=10.0)
+    if settle:
+        time.sleep(settle)
+
+
 # ---------------------------------------------------------------- 页面状况
 
 def page_state() -> str:
-    """页面指纹（地址 + 标题 + 滚动位置 + 标签页数），用来判断一步动作有没有让页面变。
+    """页面状态指纹（用来判断一步动作有没有让页面变）。
 
-    **标签页数必须算进去**：很多链接（B 站搜索结果就是）在新标签页里打开，
-    原来那个标签页的地址/标题/滚动位置一点没变——只比这三样的话，一次
-    成功的点击会被报成"页面没有任何变化"，模型就以为没生效、反复点同一个地方
-    （实测死循环的根因）。
+    包含：地址、标题、顶层滚动、标签页数、**已勾选 input 数、带选中样式元素数、
+    可见弹窗数、内部滚动区总位置**。
+
+    后四项是程序直接读的**结构化状态**（不读页面文字，不受字体加密影响）：
+    选答案/切标签/开关弹窗都不改地址，只看地址/滚动/标题的话它们会被全部
+    误报成"没有变化"，模型就反复点同一个地方（实测 3.3 测验同一个选项被点 8 次）。
+    有了这几项，"勾选数 2→3""弹窗 1→0"就是动作生效的直接证据。
 
     拿不到就返回空串，由调用方决定怎么说——查页面信息失败不该把整回合搞断。
     """
     try:
-        raw = _require().eval(_PAGE_STATE_JS)
+        raw = _require().eval(_PAGE_JS)
     except Exception:
         return ""
     if not isinstance(raw, str) or not raw:
@@ -670,6 +783,8 @@ def page_state() -> str:
     try:
         d = json.loads(raw)
     except ValueError:
+        return ""
+    if not isinstance(d, dict):
         return ""
     d["tabs"] = _tab_count()
     return json.dumps(d, ensure_ascii=False)
@@ -685,6 +800,17 @@ def _tab_count() -> int:
                     and (t.get("url") or "").startswith(("http://", "https://"))])
     except Exception:
         return -1
+
+
+def list_pages() -> list:
+    """当前所有页面标签的简要列表（id / url / title）。查不到返回空列表。"""
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{DEFAULT_PORT}/json/list", timeout=3) as r:
+            data = json.loads(r.read())
+        return [p for p in data if p.get("type") == "page"]
+    except Exception:
+        return []
 
 
 def video_info() -> str:

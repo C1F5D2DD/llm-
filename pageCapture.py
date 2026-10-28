@@ -146,7 +146,7 @@ def add_grid(img):
 # 模型擅长"这是什么、该点哪个"这类判断，不擅长毫米级的空间定位——
 # 那就别让它做后者的活。
 
-# 收集可点元素的脚本。**要注意三件事**：
+# 收集可点元素的脚本。**要注意这些**：
 #
 # 1. 坐标要加上 iframe 的偏移。学习通的播放器、目录都在 iframe 里，
 #    iframe 内部的 getBoundingClientRect 是相对它自己视口的，不加偏移就整体错位。
@@ -154,10 +154,20 @@ def add_grid(img):
 #    三层都 clickable，清单里就会冒出三个几乎一样的项，模型选编号时看花眼。
 # 3. 只要**完全在视口内**的元素——滚动之后顶部那些 y 为负的还在 DOM 里，
 #    编上号会让模型点到一个看不见的地方。
+# 4. **被浮层挡住的元素不编号**：用 elementFromPoint 检查元素中心，
+#    如果那一点最上层是别的东西（弹窗、固定头、遮罩），点了也点不到它，
+#    编号只会误导（实测：模型照着编号点，其实点在弹窗后面的元素上）。
+# 5. **可见弹窗里的控件优先编号**：弹窗最要紧，但元素一多就挤不进前 90 个，
+#    所以排序时把弹窗内的元素放前面。
+# 6. 每个入选元素打上 `data-axx-id` 属性——window_control.element_at() 靠它
+#    在点击前判断"这一点到底会点到谁"。
 _ELEMENTS_JS = """(() => {
   const VW = window.innerWidth, VH = window.innerHeight;
   const cand = [];
   const TAGS = ['A','BUTTON','INPUT','SELECT','TEXTAREA','LABEL','SUMMARY'];
+  const DIALOG_SEL = '[role="dialog"],.layui-layer,.el-dialog,.ant-modal,'
+                   + '[class*="dialog"],[class*="modal"],[class*="popup"]';
+  const CLS_RE = /btn|button|radio|checkbox|check|option|switch|play|pause|submit|cancel|close|confirm|link|tab/i;
 
   function textOf(el) {
     let t = (el.innerText || el.value || el.getAttribute('aria-label')
@@ -169,16 +179,36 @@ _ELEMENTS_JS = """(() => {
     try {
       if (TAGS.indexOf(el.tagName) >= 0) return true;
       if (el.getAttribute('onclick')) return true;
+      if (typeof el.onclick === 'function') return true;   // addEventListener 抓不到，属性赋值能抓到
       const role = el.getAttribute('role');
-      if (role === 'button' || role === 'link' || role === 'tab' || role === 'checkbox') return true;
+      if (role === 'button' || role === 'link' || role === 'tab'
+          || role === 'checkbox' || role === 'radio' || role === 'menuitem'
+          || role === 'option') return true;
+      if (CLS_RE.test(String(el.className || ''))) return true;
       return window.getComputedStyle(el).cursor === 'pointer';
     } catch (e) { return false; }
+  }
+
+  // 元素中心那一点最上层是不是它自己（或它的子孙/祖先）。
+  // 被别的元素挡住 -> false，这种元素不编号（点了也没用）。
+  function hittable(doc, el, cx, cy) {
+    try {
+      const hit = doc.elementFromPoint(cx, cy);
+      if (!hit) return true;                 // 边界情况：查不到就当没被挡
+      return hit === el || el.contains(hit) || hit.contains(el);
+    } catch (e) { return true; }
   }
 
   function collect(doc, ox, oy, depth) {
     if (!doc || depth > 3) return;
     let list;
     try { list = doc.querySelectorAll('*'); } catch (e) { return; }
+    // 清掉上一帧打的编号：编号每帧都会重排，留着旧的会让 element_at 认错
+    try {
+      doc.querySelectorAll('[data-axx-id]').forEach(e => {
+        try { e.removeAttribute('data-axx-id'); } catch (e2) {}
+      });
+    } catch (e) {}
     for (let i = 0; i < list.length; i++) {
       const el = list[i];
       try {
@@ -193,7 +223,11 @@ _ELEMENTS_JS = """(() => {
         const L = r.left + ox, T = r.top + oy, R = r.right + ox, B = r.bottom + oy;
         // 完全在视口内才编号：露出一半的，点它有一半概率点空
         if (L < -2 || T < -2 || R > VW + 2 || B > VH + 2) continue;
-        cand.push({t: textOf(el), tag: el.tagName,
+        // 中心被浮层挡住的不编号（doc 局部坐标）
+        if (!hittable(doc, el, r.left + r.width / 2, r.top + r.height / 2)) continue;
+        let pri = 1;
+        try { if (el.closest(DIALOG_SEL)) pri = 0; } catch (e) {}
+        cand.push({el: el, t: textOf(el), tag: el.tagName, pri: pri,
                    l: L, ty: T, w: r.width, h: r.height});
       } catch (e) {}
     }
@@ -230,13 +264,17 @@ _ELEMENTS_JS = """(() => {
     if (better || bothEmpty) keep[hit] = c;
   }
 
-  keep.sort((a, b) => (a.ty - b.ty) || (a.l - b.l));
-  const out = keep.slice(0, 90).map(c => ({
-    t: c.t, tag: c.tag,
-    x: Math.round(c.l + c.w / 2), y: Math.round(c.ty + c.h / 2),
-    l: Math.round(c.l), ty: Math.round(c.ty),
-    w: Math.round(c.w), h: Math.round(c.h),
-  }));
+  // 弹窗里的控件优先（弹窗最要紧，但元素多的时候容易被 90 个上限挤掉）
+  keep.sort((a, b) => (a.pri - b.pri) || (a.ty - b.ty) || (a.l - b.l));
+  const out = keep.slice(0, 90).map((c, i) => {
+    try { c.el.setAttribute('data-axx-id', String(i + 1)); } catch (e) {}
+    return {
+      t: c.t, tag: c.tag,
+      x: Math.round(c.l + c.w / 2), y: Math.round(c.ty + c.h / 2),
+      l: Math.round(c.l), ty: Math.round(c.ty),
+      w: Math.round(c.w), h: Math.round(c.h),
+    };
+  });
   return JSON.stringify(out);
 })()"""
 
@@ -326,10 +364,14 @@ class _CDP:
         self._ws_url = None
 
     def _target(self) -> dict:
-        """取当前活跃的标签页。
+        """取要截图/操作的标签页。
 
         每次都重新查——用户会手动切标签页，锁死第一次选的那个就会一直操作旧页。
         跳过 edge://newtab 这类内部页（在上面执行 JS 会失败）。
+
+        **优先「学习页」（URL 含 studentstudy）**：模型误点会开出「超星智能体」
+        之类的新标签页，它们常排在列表最前；只取第一个 http 页就会一直截错页面
+        （实测两次卡在机器人页，其中一次停了近 2 小时才被人工发现）。
         """
         try:
             with urllib.request.urlopen(
@@ -338,14 +380,26 @@ class _CDP:
         except (urllib.error.URLError, OSError) as exc:
             raise CaptureError(
                 f"连不上调试端口 {self.port}：{exc}。"
-                "Edge 要用 --remote-debugging-port 启动"
+                "Edge 要带 --remote-debugging-port 启动"
             ) from exc
         if not pages:
             raise CaptureError("浏览器里没有打开的页面")
 
         real = [p for p in pages
                 if (p.get("url") or "").startswith(("http://", "https://"))]
-        return real[0] if real else pages[0]
+        if not real:
+            return pages[0]
+
+        def rank(p: dict) -> int:
+            u = (p.get("url") or "").lower()
+            if "studentstudy" in u:
+                return 0
+            if "chaoxing.com" in u:
+                return 1
+            return 2
+
+        real.sort(key=rank)
+        return real[0]
 
     def _connect(self) -> None:
         from websockets.sync.client import connect

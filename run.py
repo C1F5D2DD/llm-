@@ -19,6 +19,8 @@ import queue
 import subprocess
 import threading
 import time
+import tkinter as tk
+import tkinter.font as tkfont
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -74,6 +76,15 @@ RIGHT_MIN_W = 420        # 右栏（对话区）的最小宽度，免得被左�
 # 一条消息可能折好几行，只数条数兜不住。
 # 另外控件越多每次追加越慢，所以这个值也不能给太大。
 CHAT_MAX_PX = 20000
+
+# 流式"活气泡"的参数（只针对长输出时的实时思考）。
+# **必须限高**：早先每 150ms 把最近 3000 字整段 configure 给一个 CTkLabel，
+# Tk 每次都要把整段重新折行排版——实测 34-55ms/次（runs/stream_bench.py、
+# runs/test_ab_stream.py），长思考时界面就一顿一顿的。现在改成 tk.Text **只追加
+# 新片、只保留看得见的尾巴**：实测 0.5ms/次，事件循环最大延迟 65ms
+# （runs/diag_e2e4.py）。旧文字反正已经滚出这个 6 行高的框，原始全文在
+# runs/brain.log 里。
+STREAM_MAX_LINES = 6      # 气泡最多显示几行；内容只保留能装下的尾部
 
 # 对话区不同来源的样式（前缀、文字色、是否加粗）
 _STYLE = {
@@ -212,14 +223,15 @@ class Viewer(ctk.CTk):
         self._chat_h = 0            # 对话区已占高度（px），超 CHAT_MAX_PX 就丢老的
         self._wrap_cur = 0          # 当前用的折行宽度，跟新算出来的一样就不折腾
         self._wrap_pending = False  # 已排了一个重新折行的回调
-        # 流式显示：模型的思考/正文逐片到达，攒成一条"活气泡"原地更新
-        self._stream_label = None   # 当前那条活气泡（None 表示还没开）
+        # 流式显示：模型的思考/正文逐片到达，往一条"活气泡"里**只追加**，
+        # 同时把看不见的头部裁掉（气泡是 tk.Text，原因见 STREAM_MAX_LINES 上面）。
+        self._stream_text = None    # 当前那条活气泡（None 表示还没开）
+        self._stream_font = None    # 气泡字体对象（估算折行用，别每 tick 新建）
         # 流式片的队列：工作线程只往里塞（list.append 原子），主线程的
         # _stream_tick 每 150ms 取一次。**绝不能**每片都 after(0) 一次——
         # 一次长输出 ~1000 片，主线程会被打成一千次重排，界面直接卡死（踩过）。
         self._stream_q: list = []
-        self._stream_buf = ""       # 已经攒下的文字
-        self._stream_kind = ""      # "think" 还是 "content"
+        self._stream_kind = ""      # 气泡里当前片的类型："think" / "content"
 
         # ---- 左栏下方：控制面板 ----
         self.panel = ctk.CTkFrame(self.left, corner_radius=16, fg_color="#83a2eb",
@@ -430,6 +442,9 @@ class Viewer(ctk.CTk):
             self._wrap_cur = wrap
             kids = self.chat.winfo_children()
             for lbl in kids:
+                # 只给消息标签重设折行；流式气泡是 tk.Text（自己去滚），不吃这个
+                if not isinstance(lbl, ctk.CTkLabel):
+                    continue
                 try:
                     lbl.configure(wraplength=wrap)
                 except Exception:
@@ -514,62 +529,138 @@ class Viewer(ctk.CTk):
             pass
         self.after(150, self._stream_tick)
 
+    def _new_stream_bubble(self):
+        """建一条流式活气泡（tk.Text，只追加、只保留看得见的尾巴）。
+
+        为什么不用 CTkLabel：Label 每次更新都要把整段文字重新折行排版，
+        长输出时一次 30-55ms；Text 只把新增的片 insert 到末尾，主线程只处理
+        新增那一小块，实测 0.5ms/次（runs/test_ab_stream.py）。
+
+        样式尽量和普通消息一致：灰字表示"这是过程，不是结论"，正式消息
+        随后会以 "ai" 再发一条。
+        """
+        # CTk 的字体是按"逻辑字号 × 显示缩放"转成像素的，Tk 要用负数才是像素，
+        # 所以这里自己算：12 号逻辑字 × 缩放 -> -30px（250% 缩放时）。
+        px = -max(1, round(12 * self._sc()))
+        tb = tk.Text(self.chat, height=STREAM_MAX_LINES, wrap="word",
+                     bd=0, highlightthickness=0, bg="#f7f8fa",
+                     fg=_STYLE["ai"][1], padx=2, pady=2,
+                     font=("Microsoft YaHei", px),
+                     takefocus=0, cursor="arrow")
+        tb.tag_configure("think", foreground=_STYLE["think"][1])
+        tb.tag_configure("body", foreground=_STYLE["ai"][1])
+        # 滚轮不让气泡滚它自己——用户想滚的是整个对话区（CTkScrollableFrame）。
+        tb.bind("<MouseWheel>", lambda _e: "break")
+        # 估算折行用：字体对象缓存一份，别每个 tick 新建
+        try:
+            self._stream_font = tkfont.Font(root=self, font=tb.cget("font"))
+        except Exception:
+            self._stream_font = None
+        tb.insert("end", "⟳ 模型输出中…\n", ("think",))
+        # 只读：用户不能往里打字（内容都是程序写的）
+        tb.configure(state="disabled")
+        tb.pack(fill="x", padx=6, pady=2, anchor="w")
+        self._stream_text = tb
+        self._stream_kind = "think"
+        return tb
+
+    def _trim_stream_tail(self, tb) -> None:
+        """删掉气泡里"已经滚出可视区"的头部，让内容行数不超过控件高度。
+
+        **不做任何 Tk 折行查询**：`count -displaylines` 在长文本上会把界面
+        卡死（实测过，绝对不能用），`yview_moveto(1.0)` 也要重算整段排版
+        （8-10ms/次、偶发 400ms）。这里用字宽估算折行，纯 Python 数行，
+        实测 0.1ms 以内（runs/diag_e2e4.py）。
+
+        删掉的旧文字不丢信息：它们本来就看不见了，原始全文在 runs/brain.log。
+        """
+        try:
+            width = tb.winfo_width()
+        except Exception:
+            width = 0
+        if width <= 50:
+            # 气泡刚 pack、布局还没跑（或者窗口还没映射）：拿对话区宽度兜底，
+            # 免得网络卡顿攒了一大堆字时首轮不裁、第一屏显示的是最老的内容。
+            try:
+                width = self.chat.winfo_width() - 20
+            except Exception:
+                width = 0
+        cw = 1
+        if self._stream_font is not None:
+            try:
+                cw = max(1, self._stream_font.measure("中"))
+            except Exception:
+                cw = 1
+        if width <= 50 or cw <= 1:
+            return                  # 还没排版（或拿不到字宽），下一个 tick 再裁
+
+        cpl = max(10, (width - 8) // cw)      # 一行大约能放几个汉字
+        for _ in range(4):
+            content = tb.get("1.0", "end-1c")
+            if not content:
+                return
+            lines = sum(max(1, -(-len(part) // cpl)) for part in content.split("\n"))
+            if lines <= STREAM_MAX_LINES:
+                return
+            over = (lines - STREAM_MAX_LINES) * cpl
+            tb.delete("1.0", f"1.0+{max(1, over)}c")
+
     def _stream_drain(self) -> None:
-        """把队列里所有片合并成一次 Label 更新。"""
-        items = []
+        """把队列里攒的片**追加**到活气泡上，然后裁掉看不见的头部（主线程）。
+
+        关键：只 insert 新片，绝不重写已有内容。早先的写法是每 150ms 把最近
+        3000 字整段 configure 给 Label，Tk 要重新折行排版整段——实测 34-55ms/次，
+        长思考时主线程两成时间耗在这上面，界面就是"一顿一顿"的。
+
+        现在只保留"能装进这个 6 行框的尾部"：不调用 yview 滚动（那一步要重算
+        整段排版，实测 8-10ms/次、偶发 400ms 卡顿），旧文字直接从前面删。
+        实测 0.5ms/次，事件循环最大延迟 ~65ms（runs/diag_e2e4.py）。
+        """
+        items: list = []
         while self._stream_q:
             items.append(self._stream_q.pop(0))
         if not items:
             return
 
-        label = self._stream_label
-        if label is None:
-            # 开一条新的活气泡
-            _, color, _ = _STYLE["think"]
-            label = ctk.CTkLabel(self.chat, text="", anchor="w", justify="left",
-                                 wraplength=self._chat_wrap(),
-                                 font=("Microsoft YaHei", 12), text_color=color)
-            label.pack(fill="x", padx=6, pady=2, anchor="w")
-            self._stream_label = label
-            self._stream_buf = ""
-            self._stream_kind = items[0][0]
+        tb = self._stream_text
+        if tb is None:
+            tb = self._new_stream_bubble()
 
-        for kind, text in items:
-            if kind != self._stream_kind:
-                # 思考结束、开始写正文：换行分隔，别糊在一起
-                self._stream_buf += "\n——— 开始输出正文 ———\n"
-                self._stream_kind = kind
-            self._stream_buf += text
-
-        # 只显示末尾一段：思考能到两万多字，全塞进一个 Label 会让控件巨大、
-        # 滚动也卡。反正界面上只需要看它"在想什么"，前面的可以滚走。
-        shown = self._stream_buf
-        if len(shown) > 3000:
-            shown = "…（前面略）…\n" + shown[-3000:]
-        prefix = "⟳ 模型输出中…" if self._stream_kind == "think" else "⟳ 模型正在写正文"
         try:
-            label.configure(text=f"{prefix}\n{shown}")
-        except Exception:
-            pass
+            tb.configure(state="normal")
+            for kind, text in items:
+                if kind != self._stream_kind:
+                    # 思考结束、开始写正文：换行分隔，别糊在一起
+                    sep = ("\n——— 开始输出正文 ———\n" if kind == "content"
+                           else "\n——— 回到思考 ———\n")
+                    tb.insert("end", sep, ("think",))
+                    self._stream_kind = kind
+                tb.insert("end", text, ("think",) if kind == "think" else ("body",))
+            self._trim_stream_tail(tb)
+        finally:
+            try:
+                tb.configure(state="disabled")
+            except Exception:
+                pass
         self._scroll_bottom()
 
     def _stream_flush(self) -> None:
-        """活气泡收尾：把剩下的片贴完，记账一次，然后交给下一条。"""
-        try:
-            if self._stream_q:
-                self._stream_drain()
-        except Exception:
-            pass
-        label = self._stream_label
-        self._stream_label = None
-        if label is None:
-            return
-        try:
-            self._chat_h += max(0, label.winfo_reqheight())
-            self._chat_trim()
-        except Exception:
-            pass
-        self._stream_buf = ""
+        """活气泡收尾：把气泡撤掉、状态重置。
+
+        **不留在对话区里**：这一步的结论紧接着会以 "ai" 消息再发一条，气泡本身
+        只是"实时过程"；留着的话一个回合最多 50 条、每条都带着一大坨文字，
+        越跑越慢（这也是之前越用越卡的一部分）。原始全文在 runs/brain.log。
+        """
+        self._stream_q.clear()
+        tb = self._stream_text
+        self._stream_text = None
+        self._stream_font = None
+        self._stream_kind = ""
+        if tb is not None:
+            try:
+                tb.destroy()
+            except Exception:
+                pass
         self._scroll_bottom()
 
     def _set_buttons(self, busy: bool) -> None:

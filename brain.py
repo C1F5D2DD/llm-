@@ -394,7 +394,7 @@ def load_config() -> Optional[Dict[str, str]]:
 
 def init(base_url: str, api_key: str, model: str,
          temperature: float = 0.15, max_tokens: int = 8000,
-         timeout: float = 90.0, json_mode: bool = True,
+         timeout: float = 5.0, json_mode: bool = True,
          reasoning_effort: str = "high") -> None:
     """配置模型并接管。失败抛 BrainError。
 
@@ -424,6 +424,12 @@ def init(base_url: str, api_key: str, model: str,
                             实测踩过：给 1500，模型在一页乱码文字上思考了 1499
                             token，**正文一个字没剩**，解析失败、界面只显示
                             一句 BrainError。给宽裕点；API 实测接受 16000。
+    timeout                 单次请求超时（秒），默认 **5**。换的那个网关不稳，
+                            宁可快速失败然后自动重发（等待时间由重试兜底），
+                            也不要卡 90 秒才报错——实测一次超时就把回合掐断，
+                            界面半天不动，体验比失败还差。
+                            注意：服务端"首字延迟"超过 5 秒时会触发重发，
+                            如果日志里超时特别多，把这个值调大一点（比如 15）。
     json_mode                True 时要求网关返回 JSON 对象；某些网关不支持，
                              报错了就传 False（这时靠提示词约束 + 容错解析）
 
@@ -447,6 +453,7 @@ def init(base_url: str, api_key: str, model: str,
         "max_tokens": max_tokens,
         "json_mode": json_mode,
         "reasoning_effort": reasoning_effort,
+        "timeout": timeout,
     }
     _log.info("配置模型：%s @ %s   json_mode=%s   reasoning_effort=%s   日志→%s",
               model, base_url, json_mode, reasoning_effort or "(不传)", LOG_PATH)
@@ -809,6 +816,8 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
         kwargs["reasoning_effort"] = effort
     downgrades = 0            # 因为"思考吃光额度"降了几次档
     empty_retries = 0         # 因为"返回空正文"原样重试了几次
+    transient_retries = 0     # 因为超时/断连/5xx 重发了几次
+    TRANSIENT_RETRIES = 6     # 网络类故障最多重发几次
 
     # 逐步降档的顺序。**要跳着降**：max/ultra/xhigh 是相邻的"极高"档，
     # 实测 max->ultra 思考量几乎没变（25794 字 vs 25855 字），白白多花一次请求
@@ -826,6 +835,17 @@ def _chat(messages: List[Dict[str, Any]]) -> Any:
                 k = droppable[0]
                 kwargs.pop(k)
                 _log.warning("网关不接受 %s（%s），去掉它重试", k, exc)
+                continue
+            # 网络类故障（超时 / 连不上 / 5xx / 429）：**自动重发**。
+            # 新换的网关连接不稳，实测一次 `Request timed out.` 就把整个回合
+            # 掐断（等了 112 秒才失败），人得手动点「继续」——比慢还难受。
+            # 超时设成 5 秒 + 退避重发，能把偶发抖动吃掉。
+            if _is_transient(exc) and transient_retries < TRANSIENT_RETRIES:
+                transient_retries += 1
+                delay = min(0.4 * transient_retries, 2.0)
+                _log.warning("请求异常（第 %d 次重发，%.1fs 后）：%s",
+                             transient_retries, delay, exc)
+                time.sleep(delay)
                 continue
             msg = _explain(exc)
             _log.error("调用模型失败：%s", exc)
@@ -959,6 +979,33 @@ def _stream_once(kwargs: Dict[str, Any], seen_any: bool = False):
     return SimpleNamespace(choices=[choice], usage=usage)
 
 
+def _is_transient(exc: Exception) -> bool:
+    """这个错误"重发一次可能就好了"吗（网络抖动类）。
+
+    换的新网关连接不稳，实测：
+    - `Request timed out.`（5 秒超时 / 之前 90 秒也超时过，一次就掐断回合）
+    - 偶发 5xx、429
+    这些**重发**通常能过；而参数错误、鉴权错误重发没用，只会把真实原因埋掉
+    （所以这个判断必须和 _is_param_error 分开）。
+    """
+    name = type(exc).__name__
+    if name in ("APITimeoutError", "APIConnectionError", "ConnectError",
+                "ReadTimeout", "ConnectTimeout", "RemoteProtocolError",
+                "TimeoutException", "ReadError", "WriteError"):
+        return True
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(code, int) and (code == 429 or 500 <= code < 600):
+        return True
+    text = str(exc).lower()
+    return any(k in text for k in ("timed out", "timeout", "connection error",
+                                   "connection reset", "temporarily",
+                                   "bad gateway", "service unavailable"))
+
+
 def _is_param_error(exc: Exception) -> bool:
     """判断这个错误是不是"某个可选参数不被支持"——只有这种才该去掉参数重试。
 
@@ -1004,6 +1051,13 @@ def _explain(exc: Exception) -> str:
         return f"请求太频繁或额度用完了（429）：{exc}"
     if code and 500 <= code < 600:
         return f"服务端出错（{code}），过会儿再试：{exc}"
+    text = str(exc).lower()
+    if code is None and ("timed out" in text or "timeout" in text):
+        timeout = _options.get("timeout", 5)
+        return (f"请求超时（单次 {timeout:g}s），已自动重发多次仍失败：{exc}\n"
+                f"    网关响应太慢或不稳。可以：换回更快的接口/模型、"
+                f"把超时调大（brain.init(timeout=...)）、"
+                f"或稍等一会儿再发一句话继续")
     return f"调用模型失败：{exc}"
 
 

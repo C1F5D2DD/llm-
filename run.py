@@ -223,9 +223,6 @@ class Viewer(ctk.CTk):
         # 每个动作做了多少次（签名 -> 次数）。超 REPEAT_LIMIT 就掐掉整个回合，
         # 见文件顶部那段说明。每个回合开始时清零。
         self._repeat: Dict[str, int] = {}
-        # 当前这帧的可点元素清单（capture.snapshot 给的），_exec 用它把
-        # 模型选的编号换成真实坐标
-        self._elements: list = []
         # 「插话打断等待」用：发消息时置上，让 _wait 立刻收工去处理你说的话。
         # 和 _stop_evt（结束整个回合）分开——插话只是想跳过剩余等待，不是要停。
         self._interrupt = threading.Event()
@@ -913,11 +910,9 @@ class Viewer(ctk.CTk):
                 # 它看到的"页面没变化"不是它动作没用，而是截图早就停了——
                 # 分不清这两者它就会一直重复同一个动作（实测：同一个坐标点了 41 次，
                 # 因为抓帧停了、图一直是同一张，模型每次都得出同样的结论）。
-                # 一次拿到配套的「图 + 元素清单」：图上的编号和清单里的下标必须
-                # 是同一帧的，否则模型说"点 7 号"会点到别处（踩过：分两次取，
-                # 中间后台线程换了帧）
-                img, elements = capture.snapshot()
-                self._elements = elements      # _exec 要用它把编号换成坐标
+                # 一次拿到旧帧检查 + 最新画面。**不再给元素编号**：编号每帧都变，
+                # 上下文里积着旧编号反而干扰模型（详见 pageCapture.annotate 注释）。
+                img = capture.get_frame()
                 stale = capture.frame_age()
                 if stale > 5.0:
                     self._ui("err", f"画面已经 {stale:.0f} 秒没更新了"
@@ -931,7 +926,7 @@ class Viewer(ctk.CTk):
                 # 2. 那些清单又长又占 token（元素 40 项 + 任务点 120 项能到上千 token），
                 #    实测还把关键信息稀释掉。
                 # 元素坐标仍然准确（不受字体影响），但那是**代码自己用来点击的**，
-                # 不需要模型知道——模型看着图上的红框编号选就行。
+                # 不需要模型知道——而且编号也已经取消：模型自己按网格坐标点。
                 page = wc.page_info(state_only=True)
                 video = wc.video_info()
                 if video:
@@ -1122,47 +1117,15 @@ class Viewer(ctk.CTk):
                 before = wc.page_state()
                 clicked_at = None
                 if t == "click":
-                    # 优先用编号：模型选编号，坐标由代码从元素清单里查（准的）。
-                    # 让它自己读坐标是行不通的——实测点「章节测验」标签，
-                    # 真实中心 214，它读成 280，偏 66px 点到隔壁去了。
-                    tgt = action.get("target")
-                    if tgt is not None:
-                        try:
-                            idx = int(tgt)
-                            # 编号从 1 开始。这里必须显式挡住 <=0：
-                            # Python 的负索引不会报错，target=0 会悄悄点到
-                            # 列表最后一个元素上（实测踩过）
-                            if idx < 1:
-                                raise ValueError("编号必须从 1 开始")
-                            el = self._elements[idx - 1]
-                            cx, cy = int(el["x"]), int(el["y"])
-                            label = str(el.get("t") or el.get("tag") or "")
-                            desc0 = f"点击 {idx} 号「{label[:20]}」"
-                        except (ValueError, TypeError, IndexError, KeyError):
-                            self._last_facts_changed = False
-                            return (f"（编号 {tgt} 不存在——当前屏只有 "
-                                    f"{len(self._elements)} 个编号；"
-                                    f"**编号只对当前屏有效，上一屏的编号不能用**，"
-                                    f"请重新看当前屏的红框编号再选）")
-                        # 点击前查一下这一点实际会点到谁：被弹窗/浮层/固定头
-                        # 挡住时能立刻发现（实测很多"点了没反应"就是点到了别处）
-                        hit = wc.element_at(cx, cy)
-                        if hit:
-                            axx = str(hit.get("axx") or "")
-                            if not axx:
-                                desc0 += (f"（注意：这个位置实际是 {hit.get('tag')}，"
-                                          f"没落在编号元素上，可能被浮层挡住）")
-                            elif axx != str(idx):
-                                desc0 += (f"（注意：这个位置实际是 {axx} 号元素，"
-                                          f"可能被浮层挡住或编号看错了）")
-                    else:
-                        cx, cy = int(action["x"]), int(action["y"])
-                        desc0 = f"已点击 ({cx}, {cy})"
-                        hit = wc.element_at(cx, cy)
-                        if hit and hit.get("axx"):
-                            desc0 += f"（坐标落在 {hit['axx']} 号元素上）"
+                    # **不再用编号**：模型直接读网格坐标点。编号每帧都在变，
+                    # 上下文里全是旧编号会把它带偏（详见 pageCapture.annotate）。
+                    if action.get("target") is not None:
+                        self._last_facts_changed = False
+                        return ("（现在没有元素编号了，请用 x / y 坐标点击；"
+                                "target 字段不再支持。对照网格刻度量一下目标中心再点）")
+                    cx, cy = int(action["x"]), int(action["y"])
                     wc.click(cx, cy, settle=0.6)
-                    desc = desc0
+                    desc = f"已点击 ({cx}, {cy})"
                     clicked_at = (cx, cy)
                 elif t == "scroll":
                     n = int(action.get("notches", 3))
@@ -1189,13 +1152,13 @@ class Viewer(ctk.CTk):
                     wc.press_key(key)
                     desc = f"已按键 {key}"
                 out = desc + self._facts(before)
-                # 点了但没观察到变化 -> 提醒模型换个编号/做法。
+                # 点了但没观察到变化 -> 提醒模型重新量坐标。
                 # **不在这里附元素文字**：那些文字是从 DOM 爬的，学习通有字体加密
                 # （DOM 里是生僻字、靠字体画成正确的字），爬来的就是错的，
-                # 喂过去只会把模型带偏。模型看着图上的红框编号重选即可。
+                # 喂过去只会把模型带偏。模型对照网格重新量目标中心即可。
                 if clicked_at and not self._last_facts_changed:
-                    out += ("\n（这次点击没引起任何可观测变化。如果点偏了，看着图上那个位置"
-                            "附近有哪个红框编号，换个编号重试。）")
+                    out += ("\n（这次点击没引起任何可观测变化。如果点偏了，"
+                            "对照网格刻度重新量一下目标中心再点。）")
                 return out
 
             if t == "wait":
@@ -1448,7 +1411,7 @@ def _repeat_limits(action_type: str) -> "tuple[int, int]":
 # （原来这里有个 _elements_text()，把可点元素列成「编号 文字」喂给模型。
 #  已删除：那些文字是从 DOM 爬的，学习通用字体加密反爬——DOM 里是生僻字
 #  （"无论牵连璔憘作何璔憘"），靠 font-cxsecret 字体才画成正确的字。
-#  图上的编号框已经够模型选，文字反而会带偏它。）
+#  后来连编号也取消了：编号每帧都在变，模型被上下文里的旧编号干扰。）
 
 def _action_sig(action: Dict[str, Any]) -> str:
     """给动作算一个"是不是同一件事"的签名，用来数重复次数。
@@ -1463,13 +1426,6 @@ def _action_sig(action: Dict[str, Any]) -> str:
     """
     t = str(action.get("type", "?"))
     if t in ("click", "scroll", "drag"):
-        # 用编号点的（target=7）必须按编号区分！早先这里只看 x/y，
-        # 而编号点击根本没有 x/y，于是所有编号点击的签名都是 "click:"，
-        # 点 33 号、16 号、26 号、21 号全被算成同一个动作，十几个不同的点击
-        # 就触发了"这个动作做了 15 次"的误报（实测踩过）。
-        tgt = action.get("target")
-        if tgt is not None:
-            return f"{t}:target={tgt}"
         nums = []
         for k in ("x", "y", "x1", "y1", "x2", "y2"):
             v = action.get(k)
@@ -1494,8 +1450,6 @@ def _action_text(action: Dict[str, Any]) -> str:
     """把一个动作翻成人能看懂的一句话，显示在对话区里。"""
     t = action.get("type")
     if t == "click":
-        if action.get("target") is not None:
-            return f"点击 {action.get('target')} 号元素"
         return f"点击 ({action.get('x')}, {action.get('y')})"
     if t == "scroll":
         n = int(action.get("notches", 3))

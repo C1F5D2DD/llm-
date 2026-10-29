@@ -161,6 +161,7 @@ def add_grid(img):
 #    所以排序时把弹窗内的元素放前面。
 # 6. 每个入选元素打上 `data-axx-id` 属性——window_control.element_at() 靠它
 #    在点击前判断"这一点到底会点到谁"。
+# 已停用：元素枚举/编号（见 annotate 上面的说明）。保留代码以备以后需要。
 _ELEMENTS_JS = """(() => {
   const VW = window.innerWidth, VH = window.innerHeight;
   const cand = [];
@@ -278,78 +279,21 @@ _ELEMENTS_JS = """(() => {
   return JSON.stringify(out);
 })()"""
 
-# 编号样式：**透明底 + 红框 + 红字**
+# 编号样式与绘制代码已删除（2026-10-29）。
 #
-# 早先用的是实心蓝底白字，问题是**挡住元素文字**：学习通目录里 "3.1 理论教学：…"
-# 这种条目，编号方块压在它左上角，正好盖住 "3.1"，模型看不清那是哪一节。
-# 改成镂空框后，底下的文字透出来，编号和内容都看得见。
-_BADGE_LINE = (210, 20, 20, 255)     # 红框
-_BADGE_TEXT = (210, 20, 20, 255)     # 红字
-_BADGE_FILL = (255, 255, 255, 90)    # 极淡的白底：只为了在深色背景上也读得清
+# 原因：可点元素的编号每一帧都在变（页面滚动、目录展开、弹窗、元素增减都会
+# 让编号重排），模型上下文里积着几十帧的旧编号，被反复干扰——它经常拿上一帧
+# 的编号去点当前帧，或者为了对上一个编号反复点同一个位置。
+# 现在不再给元素编号，模型只看网格坐标（x/y）点击。
+# 元素枚举 JS（_ELEMENTS_JS）保留但已停用，以后要用再打开。
 
 
-def _draw_badges(img, elements):
-    """把编号画在图上，返回新图。
+def annotate(img, elements=None):
+    """给图叠上坐标网格（不再画元素编号）。
 
-    设计（都是踩出来的）：
-    1. **框放在元素的上边缘处，只露一半高度**（上半截在元素外、下半截压住元素顶部）。
-       这样框离元素最近、一眼能看出它标的是谁；压住的那点高度是元素的内边距
-       （文字不在最顶上），实测不会盖住文字。
-       早先整个框都放在元素外面，元素挨得近时框会贴到**上一个元素的文字**上，
-       反而更乱。
-    2. **透明底 + 红框 + 红字**：下面的内容透得出来。
-    3. **横向避让**：元素挨着时两个框会并排挤在一起，左右错开一点。
+    elements 参数只为兼容旧调用保留，不再使用。
     """
-    if not elements:
-        return img
-    from PIL import ImageDraw
-
-    out = img.convert("RGBA")
-    layer = Image.new("RGBA", out.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-    font = _font(12)
-    W, H = out.size
-    occupied: list = []
-
-    def clash(x, y, bw, bh):
-        for ox, oy, ow in occupied:
-            if abs(x - ox) < max(bw, ow) and abs(y - oy) < bh + 1:
-                return True
-        return False
-
-    for i, el in enumerate(elements, start=1):
-        label = str(i)
-        bw = int(draw.textlength(label, font=font)) + 6
-        bh = 14
-        ex = int(el.get("l", 0))
-        ey = int(el.get("ty", 0))
-        ew = int(el.get("w", 40))
-
-        # 目标位置：元素上边缘，居中；框底边压进元素 6px
-        x0 = max(0, min(W - bw, ex + max(0, (ew - bw) // 2)))
-        y0 = max(0, ey - (bh - 6))
-
-        x, y = x0, y0
-        if clash(x, y, bw, bh):
-            for dx in (bw + 3, -(bw + 3), 2 * bw + 3, -(2 * bw + 3)):
-                nx = max(0, min(W - bw, x0 + dx))
-                if not clash(nx, y0, bw, bh):
-                    x, y = nx, y0
-                    break
-            else:
-                x, y = x0, y0        # 实在没位置就叠着，别跑远
-        occupied.append((x, y, bw))
-
-        draw.rectangle([x, y, x + bw, y + bh], fill=_BADGE_FILL,
-                       outline=_BADGE_LINE, width=1)
-        draw.text((x + 3, y + 1), label, fill=_BADGE_TEXT, font=font)
-
-    return Image.alpha_composite(out, layer).convert("RGB")
-
-
-def annotate(img, elements):
-    """给图叠上"网格 + 元素编号"。"""
-    return _draw_badges(add_grid(img), elements)
+    return add_grid(img)
 
 
 # ---------------------------------------------------------------- CDP
@@ -483,16 +427,7 @@ class _Grabber:
         while not self.stop:
             t0 = time.monotonic()
             try:
-                # 1) 先枚举可点元素（编号要画在图上，得先知道有哪些）
-                try:
-                    raw = cdp.eval(_ELEMENTS_JS)
-                    elements = json.loads(raw) if isinstance(raw, str) else (raw or [])
-                    if not isinstance(elements, list):
-                        elements = []
-                except Exception:
-                    elements = []       # 枚举失败不致命，这一帧就没有编号
-
-                # 2) 截整个视口
+                # 1) 截整个视口（不再枚举可点元素/画编号，见 annotate 注释）
                 r = cdp.call("Page.captureScreenshot",
                              {"format": "jpeg", "quality": 85})
                 img = Image.open(io.BytesIO(base64.b64decode(r["data"]))).convert("RGB")
@@ -504,10 +439,9 @@ class _Grabber:
                 if vw and vh and img.size != (vw, vh):
                     img = img.resize((vw, vh), Image.BILINEAR)
 
-                # 3) 叠网格 + 编号。元素清单和这一帧是配套的，一起存。
-                sent = annotate(img, elements)
-                self.frame = sent
-                self.elements = elements
+                # 3) 只叠网格（不再画元素编号）
+                self.frame = annotate(img)
+                self.elements = []
                 self.frame_at = time.monotonic()
                 self.error = None
             except Exception as exc:
@@ -597,18 +531,10 @@ def frame_age() -> float:
 
 
 def snapshot():
-    """一次拿到**配套的**（图, 元素清单）。
+    """一次拿到（图, 空列表）。
 
-    图和编号必须来自同一帧：图上是第 7 号，清单里的第 7 项也得是同一个元素，
-    否则模型说"点 7 号"就会点到别处。所以别分别调 get_frame() 和 elements()，
-    用这个原子接口——后台线程每 0.25 秒就换一帧，分两次取中间可能被换掉。
-
-    返回 (PIL.Image, list)。元素是 dict，含 t(文字)/x/y(中心)/w/h/l/ty。
-    返回的清单是**副本**，调用方随便用。
+    **编号已经取消**：第二个返回值恒为空列表，只为兼容旧调用保留。
+    要图直接用 get_frame()；调用方不该再依赖元素清单。
     """
     img = get_frame()          # 顺带做了过期检查，拿不到会抛
-    if _grabber is None:
-        return img, []
-    elems = _grabber.elements or []
-    # 深拷贝一层：里面的 dict 会被调用方读，别和后台线程共享同一个对象
-    return img, [dict(e) for e in elems if isinstance(e, dict)]
+    return img, []

@@ -382,7 +382,7 @@ def load_config() -> Optional[Dict[str, str]]:
 
 
 def init(base_url: str, api_key: str, model: str,
-         temperature: float = 0.15, max_tokens: int = 8000,
+         temperature: float = 0.15, max_tokens: int = 16000,
          timeout: float = 5.0, json_mode: bool = True,
          reasoning_effort: str = "high") -> None:
     """配置模型并接管。失败抛 BrainError。
@@ -408,17 +408,18 @@ def init(base_url: str, api_key: str, model: str,
                             而且结论一样。max 只是"想得更久"，不是"想得更对"——
                             对这类任务纯属浪费（还经常把额度耗到失败）。
                             网关不支持时自动去掉重试，不会因此失败。
-    max_tokens              默认 8000。**思考也占这个额度**——开了 reasoning
-                            之后 completion_tokens 里包含 reasoning_tokens。
-                            实测踩过：给 1500，模型在一页乱码文字上思考了 1499
-                            token，**正文一个字没剩**，解析失败、界面只显示
-                            一句 BrainError。给宽裕点；API 实测接受 16000。
-    timeout                 单次请求超时（秒），默认 **5**。换的那个网关不稳，
-                            宁可快速失败然后自动重发（等待时间由重试兜底），
-                            也不要卡 90 秒才报错——实测一次超时就把回合掐断，
-                            界面半天不动，体验比失败还差。
-                            注意：服务端"首字延迟"超过 5 秒时会触发重发，
-                            如果日志里超时特别多，把这个值调大一点（比如 15）。
+    max_tokens              默认 **16000**（以前 8000）。**思考也占这个额度**——
+                            开了 reasoning 之后 completion_tokens 里包含
+                            reasoning_tokens：额度给少了，模型思考一多就**正文
+                            一个字没剩**，解析失败、界面只显示一句 BrainError
+                            （实测：给 1500 时思考 1499 token，正文 0 字）。
+                            换成 v4.1-flash 后思考量明显变大，8000 经常被思考
+                            吃光，所以提到 16000（API 实测接受 16000）。
+    timeout                 **连接**超时（秒），默认 **5**。新网关连接不稳，宁可
+                            快速失败然后自动重发。**读取超时单独放宽到 60 秒**：
+                            思考型模型在服务端要想很久才吐第一个字，总超时都按
+                            5 秒算的话，请求会在"正在思考"时被掐断再重发，
+                            额度全白烧、反而更慢。
     json_mode                True 时要求网关返回 JSON 对象；某些网关不支持，
                              报错了就传 False（这时靠提示词约束 + 容错解析）
 
@@ -431,11 +432,19 @@ def init(base_url: str, api_key: str, model: str,
     if not (base_url and api_key and model):
         raise BrainError("需要 base_url、api_key、model 三项")
 
-    from openai import OpenAI      # 延迟导入：没配模型时也能用别的模块
+    from openai import OpenAI, Timeout      # 延迟导入：没配模型时也能用别的模块
 
     _ensure_log()
     base_url = _clean_base_url(base_url)
-    _client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+    # 连接要快失败（网关不稳，5 秒连不上就换一次重发）；
+    # 读取要等得起——reasoning 模型要想很久才吐第一个 token。
+    # 注意这个环境里没有装 httpx，openai 3.x 自带 httpx2 并把 Timeout 暴露在顶层。
+    read_timeout = 60.0
+    _client = OpenAI(
+        base_url=base_url, api_key=api_key,
+        timeout=Timeout(connect=timeout, read=read_timeout,
+                        write=30.0, pool=5.0),
+    )
     _model = model
     _options = {
         "temperature": temperature,
@@ -443,9 +452,12 @@ def init(base_url: str, api_key: str, model: str,
         "json_mode": json_mode,
         "reasoning_effort": reasoning_effort,
         "timeout": timeout,
+        "read_timeout": read_timeout,
     }
-    _log.info("配置模型：%s @ %s   json_mode=%s   reasoning_effort=%s   日志→%s",
-              model, base_url, json_mode, reasoning_effort or "(不传)", LOG_PATH)
+    _log.info("配置模型：%s @ %s   json_mode=%s   reasoning_effort=%s   "
+              "max_tokens=%d   连接超时=%gs/读取超时=%gs   日志→%s",
+              model, base_url, json_mode, reasoning_effort or "(不传)",
+              max_tokens, timeout, read_timeout, LOG_PATH)
 
 
 def _clean_base_url(url: str) -> str:
@@ -1042,11 +1054,13 @@ def _explain(exc: Exception) -> str:
         return f"服务端出错（{code}），过会儿再试：{exc}"
     text = str(exc).lower()
     if code is None and ("timed out" in text or "timeout" in text):
-        timeout = _options.get("timeout", 5)
-        return (f"请求超时（单次 {timeout:g}s），已自动重发多次仍失败：{exc}\n"
+        connect_to = _options.get("timeout", 5)
+        read_to = _options.get("read_timeout", 60)
+        return (f"请求超时（连接 {connect_to:g}s / 读取 {read_to:g}s），"
+                f"已自动重发多次仍失败：{exc}\n"
                 f"    网关响应太慢或不稳。可以：换回更快的接口/模型、"
-                f"把超时调大（brain.init(timeout=...)）、"
-                f"或稍等一会儿再发一句话继续")
+                f"调大读取超时（brain.init 的 timeout 只管连接，"
+                f"读取超时在 init 里写死 60s）、或稍等一会儿再发一句话继续")
     return f"调用模型失败：{exc}"
 
 

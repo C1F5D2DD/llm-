@@ -24,7 +24,7 @@ import tkinter.font as tkfont
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import customtkinter as ctk
 from PIL import Image as _PilImage, ImageTk
@@ -107,7 +107,7 @@ _STYLE = {
 }
 
 
-def launch_edge() -> int:
+def launch_edge() -> Optional[int]:
     """启动专用 Edge（带调试端口），返回主进程 pid。已在跑就复用。
 
     为什么必须用专用目录 + 调试端口：
@@ -139,7 +139,9 @@ def launch_edge() -> int:
             except (urllib.error.URLError, OSError):
                 continue
         else:
-            raise RuntimeError("Edge 启动超时")
+            raise RuntimeError(
+                "Edge 启动超时——多半是有残留 msedge 进程占着 edge/ 目录。"
+                "先在任务管理器里结束所有 msedge.exe，再重试")
 
     # Popen 给的 pid 直接用，但要确认它真持有窗口——Chromium 有时会让子进程接手
     if proc is not None and wc.find_hwnd(proc.pid):
@@ -147,7 +149,11 @@ def launch_edge() -> int:
 
     pid = find_edge_pid()
     if pid is None:
-        raise RuntimeError("拿不到 Edge 的 pid")
+        # 端口通了但枚举不到进程/窗口：**照样用 CDP 跑**，只是挪窗口、改大小
+        # 这些可选功能不可用。以前这里直接抛错，用户看到的就是"双击打不开"。
+        print("警告：拿不到 Edge 的 pid，改用纯调试协议模式（挪窗口/改大小不可用）",
+              flush=True)
+        return None
     return pid
 
 
@@ -277,7 +283,10 @@ class Viewer(ctk.CTk):
         self.cfg_hint = ctk.CTkLabel(cfg_row, text="", anchor="w",
                                      font=("Microsoft YaHei", 10), text_color="#3b4a63")
         self.cfg_hint.pack(side="left", padx=(8, 0))
-        self._load_config()     # 有存过的就填进输入框
+        # 注意：**这里不能调 _load_config()**。思考强度的下拉框 self.effort 在下面
+        # 才创建，而配置里只要带了 reasoning_effort，_load_config 就会访问它——
+        # 已保存过思考强度的用户一启动就 AttributeError 崩溃（实测：界面根本
+        # 打不开，控制台只有一行 traceback）。统一挪到 __init__ 最后再读配置。
 
         # 最大轮数：一个回合里模型最多能做多少次决策，防止它停不下来。
         # 放在这一行右侧，不新增行（新增行要改后面所有行号，容易撞车）。
@@ -379,6 +388,9 @@ class Viewer(ctk.CTk):
                                       command=self.on_stop)
         self.stop_btn.pack(side="left", padx=(6, 0))
         self._set_buttons(busy=False)
+
+        # 所有控件都建好了，这时才读配置（见上面那行注释）
+        self._load_config()
 
         self.after(100, self.refresh)
         self.after(150, self._stream_tick)   # 流式显示的节流贴字循环
@@ -1370,19 +1382,32 @@ class Viewer(ctk.CTk):
         self.after(REFRESH_MS, self.refresh)
 
     def _load_config(self) -> None:
-        """启动时把存过的配置填进输入框。没存过就留空。"""
-        cfg = brain.load_config()
+        """启动时把存过的配置填进输入框。没存过就留空。
+
+        **绝不能因为配置读不进来就崩掉界面**：这里整体 try/except，出错只提示，
+        程序照常打开（之前 reasoning_effort 的加载顺序 bug 就是在这里把启动
+        搞崩的，用户看到的是"双击没反应"）。
+        """
+        try:
+            cfg = brain.load_config()
+        except Exception as exc:
+            self.cfg_hint.configure(text=f"配置读取失败：{exc}", text_color="#b3261e")
+            return
         if not cfg:
             self.cfg_hint.configure(text="未保存过")
             return
-        self.base_url.set(cfg["base_url"])
-        self.api_key.set(cfg["api_key"])
-        self.model.set(cfg["model"])
-        # 思考强度是后加的项，老配置里没有——有就用存的，没有保持界面默认
-        eff = str(cfg.get("reasoning_effort") or "").strip()
-        if eff in EFFORTS:
-            self.effort.set(eff)
-        self.cfg_hint.configure(text="已加载保存的配置")
+        try:
+            self.base_url.set(cfg["base_url"])
+            self.api_key.set(cfg["api_key"])
+            self.model.set(cfg["model"])
+            # 思考强度是后加的项，老配置里没有——有就用存的，没有保持界面默认。
+            # hasattr 兜底：万一将来再出现"控件还没建好就读配置"的情况，也不崩。
+            eff = str(cfg.get("reasoning_effort") or "").strip()
+            if eff in EFFORTS and hasattr(self, "effort"):
+                self.effort.set(eff)
+            self.cfg_hint.configure(text="已加载保存的配置")
+        except Exception as exc:
+            self.cfg_hint.configure(text=f"配置应用失败：{exc}", text_color="#b3261e")
 
     def on_save_config(self) -> None:
         """把当前填的三项存下来，下次启动自动读。
@@ -1497,31 +1522,92 @@ def _action_text(action: Dict[str, Any]) -> str:
     return str(action)
 
 
+def find_edge_pid() -> "int | None":
+    """查 Edge 的 pid：优先有主窗口的那个，都没有就返回第一个。
+
+    用 Toolhelp 快照（`wc.list_pids`），**不用 tasklist**：受限环境里 tasklist 会
+    报 "Access denied"，以前这里返回 None，上层再抛"拿不到 Edge 的 pid"，
+    整个程序就起不来——用户看到的只是"双击打不开"（实测踩过）。
+    """
+    pids = wc.list_pids("msedge.exe")
+    if not pids:
+        return None
+    for pid in pids:
+        if wc.find_hwnd(pid):
+            return pid
+    return pids[0]
+
+
+def _fail(msg: str) -> int:
+    """打印失败原因，并写一份到 runs/startup_error.txt。
+
+    双击运行时控制台一闪就没了，用户只能看到"打不开"；有了这个文件，
+    下次出问题直接看它就知道卡在哪（也方便发给我）。
+    """
+    print(msg)
+    try:
+        p = ROOT / "runs" / "startup_error.txt"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n",
+                     encoding="utf-8")
+    except Exception:
+        pass
+    return 1
+
+
 def main() -> int:
     try:
         pid = launch_edge()
     except Exception as exc:
-        print(f"启动 Edge 失败：{exc}")
-        return 1
+        return _fail(f"启动 Edge 失败：{exc}")
     print(f"Edge pid={pid}")
 
+    # 接管分三步，**能降级的都降级**，别因为一个可选功能失败就整个打不开：
+    # 1. CDP 连不上 -> 没法截图/点击，必须退出；
+    # 2. 窗口句柄拿不到 -> 照样能后台跑，只是挪窗口/改大小不可用；
+    # 3. 抓帧线程起不来 -> 没法工作，退出。
     try:
         wc.init(pid)
+    except Exception as exc:
+        return _fail(f"接管失败：{exc}")
+
+    try:
         # 把窗口定成小尺寸，网站会按它自动排版——这样截到的就是
         # "小窗口里的完整页面"，而不是从大窗口裁一块出来。
         # 高度要加掉浏览器界面（标签栏+地址栏）占的那一截。
         wc.resize(VIEW_W + 16, VIEW_H + 95)
         # 先摆到屏幕上，尺寸/位置有个确定的起点；之后想藏起来可以用界面的开关
         wc.move_in()
-        capture.init(pid)   # 截图通道（CDP）
-        print("已接管，开始刷画面")
     except Exception as exc:
-        print(f"接管失败：{exc}")
-        return 1
+        print(f"窗口调整失败（不影响后台运行）：{exc}", flush=True)
+
+    try:
+        capture.init(pid)   # 截图通道（CDP）
+    except Exception as exc:
+        return _fail(f"抓帧初始化失败：{exc}")
+    print("已接管，开始刷画面")
 
     Viewer().mainloop()
     return 0
 
 
+def _write_startup_error() -> None:
+    """把未捕获异常的完整堆栈写进 runs/startup_error.txt（双击运行时看不到控制台）。"""
+    import traceback
+    try:
+        p = ROOT / "runs" / "startup_error.txt"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(traceback.format_exc(), encoding="utf-8")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _code = main()
+    except SystemExit:
+        raise
+    except BaseException:
+        _write_startup_error()
+        raise
+    raise SystemExit(_code)

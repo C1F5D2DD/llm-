@@ -26,7 +26,7 @@ import urllib.request
 from ctypes import wintypes
 from typing import Optional
 
-__all__ = ["init", "find_hwnd", "click", "drag", "scroll",
+__all__ = ["init", "find_hwnd", "list_pids", "click", "drag", "scroll",
            "type_text", "press_key", "reload_page", "element_at", "navigate",
            "page_state", "page_info", "video_info", "list_pages",
            "move_out", "move_in", "resize", "WindowError"]
@@ -334,6 +334,52 @@ def find_hwnd(pid: int) -> Optional[int]:
     return _find_window(pid)
 
 
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+def list_pids(exe_name: str) -> "list[int]":
+    """按 exe 名列出所有进程 pid（Toolhelp 快照，**不依赖 tasklist**）。
+
+    为什么要自己枚举：受限环境（沙箱/服务账号/某些安全软件）里 `tasklist`
+    会直接报 "Access denied"，之前 run.py 用它找 Edge，结果整个程序起不来——
+    用户看到的就是"双击没反应/窗口打不开"，控制台只有一句"拿不到 Edge 的 pid"
+    （实测）。Toolhelp 快照在这种环境下仍然可用。
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    target = exe_name.strip().lower()
+    pids: "list[int]" = []
+    handle = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not handle or handle == wintypes.HANDLE(-1).value:
+        return pids
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Process32FirstW(handle, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() == target:
+                pids.append(int(entry.th32ProcessID))
+            ok = kernel32.Process32NextW(handle, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(handle)
+    return pids
+
+
 class _CDP:
     """一条 CDP 连接。断线后下次调用自动重连。"""
 
@@ -427,34 +473,38 @@ _hwnd: Optional[int] = None
 _pid: Optional[int] = None       # 记着 pid，句柄失效时好按它重新找窗口
 
 
-def init(pid: int) -> int:
-    """接管指定进程的浏览器窗口。返回窗口句柄。失败抛 WindowError。
+def init(pid: Optional[int]) -> Optional[int]:
+    """接管浏览器。返回窗口句柄（可能为 None）。CDP 连不上才抛 WindowError。
 
-    pid 是 Edge 的主进程 pid（run.py 启动后传进来）。
-    Edge 必须带 --remote-debugging-port=9222 启动，否则连不上——
-    Chromium 忽略程序伪造的鼠标消息，只能走调试协议才能后台点击。
+    pid 是 Edge 主进程的 pid；**现在允许 pid=None 或找不到窗口**：真正干活的是
+    CDP（截图/点击/滚动都走它），窗口句柄只用于"挪窗口、改大小"这些可选操作。
+    以前窗口枚举失败就直接抛错、整个程序起不来（实测：Edge 窗口枚举不到时
+    run.py 双击打不开，控制台只有一句"接管失败"）。现在找不到窗口只打印提醒，
+    继续用 CDP 跑，只是移动/缩放/显示窗口那几个按钮会失败。
     """
     global _cdp, _hwnd, _pid
 
     _pid = pid
-    _hwnd = _find_window(pid)
-    if _hwnd is None:
-        raise WindowError(f"进程 {pid} 没找到浏览器窗口，确认它开着且没最小化")
+    hwnd = _find_window(pid) if pid else None
+    if hwnd is None:
+        print(f"[window_control] 没找到浏览器窗口（pid={pid}），"
+              f"改为只走调试协议；挪窗口/改大小的功能不可用", flush=True)
 
-    # 窗口找到了，但 CDP 连不上就等于没法点击，这里要明确报错别让它半死不活
+    # CDP 连不上就等于没法截图/点击，这里要明确报错别让它半死不活
     cdp = _CDP(DEFAULT_PORT)
     try:
         cdp.eval("1")
     except WindowError as exc:
         _hwnd = None
         raise WindowError(
-            f"窗口找到了，但连不上调试端口 {DEFAULT_PORT}（{exc}）。"
+            f"连不上调试端口 {DEFAULT_PORT}（{exc}）。"
             "Edge 必须用 run.py 那样带 --remote-debugging-port 启动，"
             "而且要用独立的 --user-data-dir，否则新命令只会被已有实例接管、端口不开"
         ) from exc
 
     _cdp = cdp
-    return _hwnd
+    _hwnd = hwnd
+    return hwnd
 
 
 def _live_hwnd() -> int:

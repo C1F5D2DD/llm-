@@ -522,16 +522,13 @@ _grabber: Optional[_Grabber] = None
 
 # ---------------------------------------------------------------- 对外接口
 
-def init(pid: int) -> None:
+def init(pid: Optional[int] = None) -> None:
     """接管浏览器。失败抛 CaptureError。不返回东西——之后只跟 get_frame 打交道。
 
-    pid 只用来确认浏览器在跑，实际通信走调试端口。
-    会在后台起一个抓帧线程，所以 init 之后 get_frame() 是很快的。
+    pid 只用来做个记录：**真正通信走调试端口**，窗口枚举失败（pid 拿不到）时
+    也照样能截图。所以现在允许 pid=None。
     """
     global _grabber
-
-    if not pid:
-        raise CaptureError("init(pid) 需要浏览器进程的 pid")
 
     # 先连一次探路，连不上就早点抛错，别等后台线程反复失败
     _CDP(DEFAULT_PORT).eval("innerWidth")

@@ -13,6 +13,9 @@ brain.config.json
 # 运行产物：日志、调试截图
 runs/
 
+# 本地备份压缩包（可能含 edge/ 登录态与 brain.config.json 密钥，别上传）
+*.7z
+
 # 旧实现的存档（保留在本地，不上传）
 archive/
 
